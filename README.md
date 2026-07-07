@@ -16,6 +16,10 @@ it back. Nothing leaves your network.
 | `desktop/` | notes | use [Handy](https://github.com/cjpais/Handy) (open-source, hotkey-to-type) locally, or point any OpenAI-compatible dictation client at the server |
 | `android/` | planned | thin voice-keyboard IME that records, POSTs to the server (e.g. over Tailscale), and commits cleaned text into any app |
 
+Because the endpoint speaks the OpenAI transcription API, any client with a
+configurable STT URL works out of the box — point it at
+`http://your-host:8123` and dictate.
+
 ## Server quickstart
 
 ```bash
