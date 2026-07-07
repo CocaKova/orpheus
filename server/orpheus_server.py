@@ -1,4 +1,4 @@
-"""Steno — local dictation engine.
+"""Orpheus — local dictation engine.
 
 OpenAI-compatible speech-to-text server wrapping NVIDIA Parakeet TDT,
 with an optional LLM cleanup pass (filler removal, punctuation) via any
@@ -8,12 +8,12 @@ OpenAI-compatible chat endpoint running on the same box.
     GET  /healthz
 
 Environment:
-    STENO_MODEL          NeMo model name  (default nvidia/parakeet-tdt-0.6b-v2)
-    STENO_PORT           listen port      (default 8123)
-    STENO_CLEAN_DEFAULT  run cleanup pass unless request overrides (default true)
-    STENO_CLEAN_URL      OpenAI-compatible base URL for cleanup
+    ORPHEUS_MODEL          NeMo model name  (default nvidia/parakeet-tdt-0.6b-v2)
+    ORPHEUS_PORT           listen port      (default 8123)
+    ORPHEUS_CLEAN_DEFAULT  run cleanup pass unless request overrides (default true)
+    ORPHEUS_CLEAN_URL      OpenAI-compatible base URL for cleanup
                          (default http://127.0.0.1:8000/v1)
-    STENO_CLEAN_MODEL    cleanup model id (default: auto-discover via /models)
+    ORPHEUS_CLEAN_MODEL    cleanup model id (default: auto-discover via /models)
 """
 
 import asyncio
@@ -27,10 +27,10 @@ import httpx
 from fastapi import FastAPI, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-MODEL_NAME = os.environ.get("STENO_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
-CLEAN_DEFAULT = os.environ.get("STENO_CLEAN_DEFAULT", "true").lower() == "true"
-CLEAN_URL = os.environ.get("STENO_CLEAN_URL", "http://127.0.0.1:8000/v1")
-CLEAN_MODEL = os.environ.get("STENO_CLEAN_MODEL", "")
+MODEL_NAME = os.environ.get("ORPHEUS_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
+CLEAN_DEFAULT = os.environ.get("ORPHEUS_CLEAN_DEFAULT", "true").lower() == "true"
+CLEAN_URL = os.environ.get("ORPHEUS_CLEAN_URL", "http://127.0.0.1:8000/v1")
+CLEAN_MODEL = os.environ.get("ORPHEUS_CLEAN_MODEL", "")
 
 CLEAN_PROMPT = (
     "You clean up raw speech-to-text dictation. Remove filler words (um, uh, "
@@ -41,10 +41,10 @@ CLEAN_PROMPT = (
     "Output only the cleaned text, nothing else."
 )
 
-log = logging.getLogger("steno")
+log = logging.getLogger("orpheus")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
 
-app = FastAPI(title="steno")
+app = FastAPI(title="orpheus")
 asr_model = None
 gpu_lock = asyncio.Lock()
 
@@ -178,4 +178,4 @@ async def transcriptions(
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("STENO_PORT", "8123")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("ORPHEUS_PORT", "8123")))

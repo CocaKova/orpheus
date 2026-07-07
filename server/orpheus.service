@@ -1,0 +1,15 @@
+[Unit]
+Description=Orpheus - local dictation engine (Parakeet TDT + LLM cleanup)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/orpheus/server
+Environment=ORPHEUS_PORT=8123
+Environment=ORPHEUS_CLEAN_URL=http://127.0.0.1:8000/v1
+ExecStart=%h/workspace/orpheus/server/.venv/bin/python orpheus_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

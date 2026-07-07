@@ -1,8 +1,8 @@
-# Steno
+# Orpheus
 
 Your voice, your machine, no word limits.
 
-Steno is a self-hosted dictation stack — an open alternative to cloud
+Orpheus is a self-hosted dictation stack — an open alternative to cloud
 dictation apps like Wispr Flow. Speak on your phone or desktop; a GPU box on
 your own network transcribes it (NVIDIA Parakeet TDT), polishes it with a
 local LLM (filler removal, punctuation, self-correction handling), and types
@@ -25,7 +25,7 @@ uv pip install --python .venv/bin/python \
   --index-url https://download.pytorch.org/whl/cu130 \
   --extra-index-url https://pypi.org/simple "torch==2.11.*"
 uv pip install --python .venv/bin/python -r requirements.txt
-.venv/bin/python steno_server.py
+.venv/bin/python orpheus_server.py
 ```
 
 First start downloads the Parakeet model (~2.4 GB). Then:
@@ -39,11 +39,11 @@ Any audio format ffmpeg can read is accepted. `clean=false` skips the LLM
 polish and returns raw ASR output.
 
 The cleanup pass talks to any OpenAI-compatible chat endpoint
-(`STENO_CLEAN_URL`, default `http://127.0.0.1:8000/v1`) and auto-discovers
-the loaded model. If the endpoint is down, Steno degrades gracefully to raw
+(`ORPHEUS_CLEAN_URL`, default `http://127.0.0.1:8000/v1`) and auto-discovers
+the loaded model. If the endpoint is down, Orpheus degrades gracefully to raw
 transcription — dictation never blocks on the polish.
 
-A sample systemd user unit is in `server/steno.service`.
+A sample systemd user unit is in `server/orpheus.service`.
 
 ## License
 
