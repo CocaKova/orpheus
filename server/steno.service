@@ -1,0 +1,15 @@
+[Unit]
+Description=Steno - local dictation engine (Parakeet TDT + LLM cleanup)
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/workspace/steno/server
+Environment=STENO_PORT=8123
+Environment=STENO_CLEAN_URL=http://127.0.0.1:8000/v1
+ExecStart=%h/workspace/steno/server/.venv/bin/python steno_server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,10 @@
+# install with: uv pip install -r requirements.txt
+# torch first, from the CUDA index matching your box, e.g.:
+#   uv pip install --index-url https://download.pytorch.org/whl/cu130 "torch==2.11.*"
+nemo_toolkit[asr]>=2.7
+numba>=0.60
+librosa>=0.10.2
+fastapi
+uvicorn[standard]
+python-multipart
+httpx
