@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- five waveform bars, rounded caps -->
+    <path
+        android:fillColor="#B39DFF"
+        android:pathData="M36,48 a3,3 0 0 1 6,0 v12 a3,3 0 0 1 -6,0 z" />
+    <path
+        android:fillColor="#B39DFF"
+        android:pathData="M44,42 a3,3 0 0 1 6,0 v24 a3,3 0 0 1 -6,0 z" />
+    <path
+        android:fillColor="#D6C9FF"
+        android:pathData="M52,34 a3,3 0 0 1 6,0 v40 a3,3 0 0 1 -6,0 z" />
+    <path
+        android:fillColor="#B39DFF"
+        android:pathData="M60,42 a3,3 0 0 1 6,0 v24 a3,3 0 0 1 -6,0 z" />
+    <path
+        android:fillColor="#B39DFF"
+        android:pathData="M68,48 a3,3 0 0 1 6,0 v12 a3,3 0 0 1 -6,0 z" />
+</vector>
