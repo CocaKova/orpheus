@@ -37,6 +37,7 @@ class OrpheusAccessibilityService : AccessibilityService() {
     private var bubble: BubbleView? = null
     private var params: WindowManager.LayoutParams? = null
     private var attached = false
+    private var hiding = false
     private var keyboardVisible = false
     private var state = BubbleState.IDLE
     private var recorder: WavRecorder? = null
@@ -95,8 +96,8 @@ class OrpheusAccessibilityService : AccessibilityService() {
                 dragStartY = p.y
             },
             onDragTo = { dx, dy ->
-                p.x = (dragStartX + dx).coerceAtLeast(0)
-                p.y = (dragStartY + dy).coerceAtLeast(0)
+                p.x = clampX(dragStartX + dx)
+                p.y = clampY(dragStartY + dy)
                 if (attached) windowManager.updateViewLayout(bubble, p)
             },
             onDragEnd = {
@@ -104,6 +105,17 @@ class OrpheusAccessibilityService : AccessibilityService() {
                 prefs.bubbleY = p.y
             },
         )
+    }
+
+    /** Keep the whole bubble on screen — losing it off an edge means losing dictation. */
+    private fun clampX(x: Int): Int {
+        val size = params?.width ?: 0
+        return x.coerceIn(0, (resources.displayMetrics.widthPixels - size).coerceAtLeast(0))
+    }
+
+    private fun clampY(y: Int): Int {
+        val size = params?.height ?: 0
+        return y.coerceIn(0, (resources.displayMetrics.heightPixels - size).coerceAtLeast(0))
     }
 
     private fun refreshKeyboardVisibility() {
@@ -120,12 +132,45 @@ class OrpheusAccessibilityService : AccessibilityService() {
         val b = bubble ?: return
         // stay visible mid-recording/transcription even if the keyboard closes
         val shouldShow = keyboardVisible || state != BubbleState.IDLE
-        if (shouldShow && !attached) {
+        if (shouldShow) {
+            if (attached) {
+                if (hiding) { // re-show caught the hide mid-animation: reverse it in place
+                    hiding = false
+                    b.animate().cancel()
+                    b.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                        .setDuration(160L)
+                        .setInterpolator(android.view.animation.OvershootInterpolator(1.4f))
+                        .start()
+                }
+                return
+            }
+            // re-clamp the saved spot: rotation/display changes can strand it off-screen
+            params?.let { it.x = clampX(it.x); it.y = clampY(it.y) }
             runCatching { windowManager.addView(b, params) }
-                .onSuccess { attached = true }
-        } else if (!shouldShow && attached) {
-            runCatching { windowManager.removeView(b) }
-            attached = false
+                .onSuccess {
+                    attached = true
+                    b.alpha = 0f
+                    b.scaleX = 0.6f
+                    b.scaleY = 0.6f
+                    b.animate().alpha(1f).scaleX(1f).scaleY(1f)
+                        .setDuration(220L)
+                        .setInterpolator(android.view.animation.OvershootInterpolator(1.4f))
+                        .start()
+                }
+        } else if (attached && !hiding) {
+            hiding = true
+            b.animate().cancel()
+            b.animate().alpha(0f).scaleX(0.6f).scaleY(0.6f)
+                .setDuration(160L)
+                .setInterpolator(android.view.animation.AccelerateInterpolator())
+                .withEndAction {
+                    if (hiding) {
+                        hiding = false
+                        attached = false
+                        runCatching { windowManager.removeView(b) }
+                    }
+                }
+                .start()
         }
     }
 
