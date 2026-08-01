@@ -14,10 +14,12 @@ import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.view.accessibility.AccessibilityWindowInfo
 import android.widget.Toast
+import android.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -27,6 +29,8 @@ import java.io.File
  * floats the Orpheus bubble next to it. Tap / hold the bubble to dictate;
  * the transcript is copied to the clipboard and pasted into the focused field.
  */
+private const val TAG = "Orpheus"
+
 class OrpheusAccessibilityService : AccessibilityService() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -247,13 +251,25 @@ class OrpheusAccessibilityService : AccessibilityService() {
         val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
         clipboard.setPrimaryClip(ClipData.newPlainText("Orpheus dictation", text))
         log.append(text)
-        if (!pasteIntoFocusedField(text)) toast("Copied to clipboard")
+        if (!pasteIntoFocusedField(text)) {
+            // Input focus can be mid-flight right after the orb tap settles — one breath, retry.
+            scope.launch {
+                delay(350)
+                if (!pasteIntoFocusedField(text)) toast("Copied to clipboard")
+            }
+        }
     }
 
     /** Paste at the cursor if a text field has focus; falls back to set-text append. */
     private fun pasteIntoFocusedField(text: String): Boolean {
-        val node = findFocusedEditable() ?: return false
+        val node = findFocusedEditable()
+        if (node == null) {
+            Log.i(TAG, "paste: no focused editable (active=${rootInActiveWindow?.packageName}, windows=${windows.size})")
+            return false
+        }
+        Log.i(TAG, "paste: target=${node.packageName}/${node.className}")
         if (node.performAction(AccessibilityNodeInfo.ACTION_PASTE)) return true
+        Log.i(TAG, "paste: ACTION_PASTE refused, trying set-text")
         val existing = if (node.isShowingHintText) "" else (node.text?.toString() ?: "")
         val args = Bundle().apply {
             putCharSequence(
@@ -261,7 +277,9 @@ class OrpheusAccessibilityService : AccessibilityService() {
                 if (existing.isBlank()) text else "$existing $text"
             )
         }
-        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args).also {
+            if (!it) Log.i(TAG, "paste: ACTION_SET_TEXT refused")
+        }
     }
 
     private fun findFocusedEditable(): AccessibilityNodeInfo? {
