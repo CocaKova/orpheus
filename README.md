@@ -64,8 +64,10 @@ A standalone dictation app (`android/`) in the spirit of Wispr Flow:
   while held. The transcript is copied to the clipboard and pasted straight
   into the focused text field.
 - **Dashboard** — words dictated today / this week / all time, plus a local
-  history of every transcript (tap to re-copy). The log never leaves the
-  device.
+  history of every transcript (tap to re-copy, long-press to delete, export
+  via the share sheet). Transcripts age out after 30 days by default —
+  configurable from 7 days to forever, or off entirely — while the word-count
+  stats are kept for good. The log never leaves the device.
 - **Universal STT** — same OpenAI-compatible client as everything else here:
   point it at your Orpheus server, or OpenAI, or Groq, with optional API key
   and model fields. A test-connection button tells you the setup works before
