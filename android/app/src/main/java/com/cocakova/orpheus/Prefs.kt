@@ -25,6 +25,11 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("raw_mode", false)
         set(v) = sp.edit().putBoolean("raw_mode", v).apply()
 
+    /** Days to keep transcripts; -1 = forever, 0 = don't record new ones. */
+    var retentionDays: Int
+        get() = sp.getInt("retention_days", 30)
+        set(v) = sp.edit().putInt("retention_days", v).apply()
+
     var bubbleX: Int
         get() = sp.getInt("bubble_x", -1)
         set(v) = sp.edit().putInt("bubble_x", v).apply()

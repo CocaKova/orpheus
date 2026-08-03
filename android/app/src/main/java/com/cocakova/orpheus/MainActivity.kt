@@ -11,9 +11,11 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -35,6 +37,8 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
@@ -61,15 +65,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.text.DateFormat
-import java.util.Calendar
+import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.Locale
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -99,12 +106,15 @@ fun OrpheusApp() {
     var micGranted by remember { mutableStateOf(hasMic(context)) }
     var accessibilityOn by remember { mutableStateOf(isAccessibilityEnabled(context)) }
     var entries by remember { mutableStateOf(log.readAll()) }
+    var tallies by remember { mutableStateOf(log.tallies()) }
     var sttUrl by remember { mutableStateOf(prefs.sttUrl) }
     var sttApiKey by remember { mutableStateOf(prefs.sttApiKey) }
     var sttModel by remember { mutableStateOf(prefs.sttModel) }
     var rawMode by remember { mutableStateOf(prefs.rawMode) }
+    var retention by remember { mutableStateOf(prefs.retentionDays) }
     var testing by remember { mutableStateOf(false) }
     var confirmClear by remember { mutableStateOf(false) }
+    var pendingDelete by remember { mutableStateOf<TranscriptEntry?>(null) }
     val scope = rememberCoroutineScope()
 
     // Refresh permission states + history whenever we come back to the foreground
@@ -114,7 +124,9 @@ fun OrpheusApp() {
             if (event == Lifecycle.Event.ON_RESUME) {
                 micGranted = hasMic(context)
                 accessibilityOn = isAccessibilityEnabled(context)
+                log.prune(prefs.retentionDays)
                 entries = log.readAll()
+                tallies = log.tallies()
             }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
@@ -172,7 +184,7 @@ fun OrpheusApp() {
                     )
                 }
 
-                item { StatsRow(entries) }
+                item { StatsRow(tallies) }
 
                 item {
                     Card {
@@ -286,7 +298,47 @@ fun OrpheusApp() {
                             modifier = Modifier.weight(1f),
                         )
                         if (entries.isNotEmpty()) {
+                            TextButton(onClick = { exportHistory(context, entries) }) { Text("Export") }
                             TextButton(onClick = { confirmClear = true }) { Text("Clear") }
+                        }
+                    }
+                }
+
+                item {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                "Keep transcripts",
+                                style = MaterialTheme.typography.bodyMedium,
+                            )
+                            Text(
+                                "Older entries are deleted automatically. Word counts are kept forever.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        var menuOpen by remember { mutableStateOf(false) }
+                        Box {
+                            TextButton(onClick = { menuOpen = true }) {
+                                Text(
+                                    RETENTION_OPTIONS.firstOrNull { it.second == retention }?.first
+                                        ?: "$retention days"
+                                )
+                            }
+                            DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                                RETENTION_OPTIONS.forEach { (label, days) ->
+                                    DropdownMenuItem(
+                                        text = { Text(label) },
+                                        onClick = {
+                                            menuOpen = false
+                                            retention = days
+                                            prefs.retentionDays = days
+                                            log.prune(days)
+                                            entries = log.readAll()
+                                        },
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -301,10 +353,14 @@ fun OrpheusApp() {
                     }
                 } else {
                     items(entries.asReversed()) { entry ->
-                        TranscriptCard(entry) {
-                            copyToClipboard(context, entry.text)
-                            Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
-                        }
+                        TranscriptCard(
+                            entry,
+                            onCopy = {
+                                copyToClipboard(context, entry.text)
+                                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                            },
+                            onDelete = { pendingDelete = entry },
+                        )
                     }
                 }
             }
@@ -313,7 +369,7 @@ fun OrpheusApp() {
                 AlertDialog(
                     onDismissRequest = { confirmClear = false },
                     title = { Text("Clear history?") },
-                    text = { Text("Deletes every saved transcript and resets the word counts. This can't be undone.") },
+                    text = { Text("Deletes every saved transcript. Your word-count stats are kept. This can't be undone.") },
                     confirmButton = {
                         TextButton(onClick = {
                             log.clear()
@@ -326,8 +382,53 @@ fun OrpheusApp() {
                     },
                 )
             }
+
+            pendingDelete?.let { entry ->
+                AlertDialog(
+                    onDismissRequest = { pendingDelete = null },
+                    title = { Text("Delete this transcript?") },
+                    text = { Text(entry.text.take(120) + if (entry.text.length > 120) "…" else "") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            log.deleteEntry(entry.ts)
+                            entries = log.readAll()
+                            pendingDelete = null
+                        }) { Text("Delete") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { pendingDelete = null }) { Text("Cancel") }
+                    },
+                )
+            }
         }
     }
+}
+
+private val RETENTION_OPTIONS = listOf(
+    "7 days" to 7,
+    "30 days" to 30,
+    "90 days" to 90,
+    "Forever" to TranscriptLog.RETENTION_FOREVER,
+    "Don't keep" to TranscriptLog.RETENTION_OFF,
+)
+
+/** Writes history as plain text into a cache file and hands it to the share sheet. */
+private fun exportHistory(context: Context, entries: List<TranscriptEntry>) {
+    val fmt = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
+    val dir = File(context.cacheDir, "export").apply { mkdirs() }
+    val out = File(dir, "orpheus-transcripts.txt")
+    out.bufferedWriter().use { w ->
+        for (e in entries) {
+            w.write("[${fmt.format(Date(e.ts))}] ${e.text}")
+            w.newLine()
+        }
+    }
+    val uri = FileProvider.getUriForFile(context, "com.cocakova.orpheus.fileprovider", out)
+    val send = Intent(Intent.ACTION_SEND)
+        .setType("text/plain")
+        .putExtra(Intent.EXTRA_STREAM, uri)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    context.startActivity(Intent.createChooser(send, "Export transcripts"))
 }
 
 @Composable
@@ -398,19 +499,14 @@ private fun SetupRow(
 }
 
 @Composable
-private fun StatsRow(entries: List<TranscriptEntry>) {
-    val todayStart = remember(entries) {
-        Calendar.getInstance().apply {
-            set(Calendar.HOUR_OF_DAY, 0)
-            set(Calendar.MINUTE, 0)
-            set(Calendar.SECOND, 0)
-            set(Calendar.MILLISECOND, 0)
-        }.timeInMillis
-    }
-    val weekStart = System.currentTimeMillis() - 7L * 24 * 60 * 60 * 1000
-    val today = entries.filter { it.ts >= todayStart }.sumOf { it.words }
-    val week = entries.filter { it.ts >= weekStart }.sumOf { it.words }
-    val all = entries.sumOf { it.words }
+private fun StatsRow(tallies: List<DayTally>) {
+    // Stats come from the per-day tallies, which outlive pruned transcripts.
+    val fmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.US) }
+    val todayKey = fmt.format(Date())
+    val weekFloor = fmt.format(Date(System.currentTimeMillis() - 6L * 24 * 60 * 60 * 1000))
+    val today = tallies.firstOrNull { it.day == todayKey }?.words ?: 0
+    val week = tallies.filter { it.day >= weekFloor }.sumOf { it.words }
+    val all = tallies.sumOf { it.words }
 
     Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         StatCard("Today", today, Modifier.weight(1f))
@@ -441,14 +537,17 @@ private fun StatCard(label: String, words: Int, modifier: Modifier = Modifier) {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun TranscriptCard(entry: TranscriptEntry, onCopy: () -> Unit) {
+private fun TranscriptCard(entry: TranscriptEntry, onCopy: () -> Unit, onDelete: () -> Unit) {
     val time = remember(entry.ts) {
         DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT)
             .format(Date(entry.ts))
     }
     Card(
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onCopy),
+        // tap = copy, long-press = delete
+        modifier = Modifier.fillMaxWidth()
+            .combinedClickable(onClick = onCopy, onLongClick = onDelete),
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surfaceVariant,
         ),

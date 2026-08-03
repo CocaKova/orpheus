@@ -248,7 +248,7 @@ class OrpheusAccessibilityService : AccessibilityService() {
 
     private fun deliver(text: String) {
         copyToClipboard(this, text)
-        log.append(text)
+        log.append(text, prefs.retentionDays)
         if (!pasteIntoFocusedField(text)) {
             // Input focus can be mid-flight right after the orb tap settles — one breath, retry.
             scope.launch {
