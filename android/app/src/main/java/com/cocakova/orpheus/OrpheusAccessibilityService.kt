@@ -1,8 +1,6 @@
 package com.cocakova.orpheus
 
 import android.accessibilityservice.AccessibilityService
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -234,7 +232,8 @@ class OrpheusAccessibilityService : AccessibilityService() {
         scope.launch {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
-                    SttClient(prefs.sttUrl, prefs.sttApiKey).transcribe(file, prefs.sttModel)
+                    SttClient(prefs.sttUrl, prefs.sttApiKey)
+                        .transcribe(file, prefs.sttModel, prefs.rawMode)
                 }
             }
             file.delete()
@@ -248,8 +247,7 @@ class OrpheusAccessibilityService : AccessibilityService() {
     }
 
     private fun deliver(text: String) {
-        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-        clipboard.setPrimaryClip(ClipData.newPlainText("Orpheus dictation", text))
+        copyToClipboard(this, text)
         log.append(text)
         if (!pasteIntoFocusedField(text)) {
             // Input focus can be mid-flight right after the orb tap settles — one breath, retry.

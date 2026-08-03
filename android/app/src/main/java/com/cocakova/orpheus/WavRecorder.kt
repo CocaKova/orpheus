@@ -47,6 +47,7 @@ class WavRecorder(
         rec.startRecording()
         worker = thread(name = "orpheus-rec") {
             val buf = ShortArray(2048)
+            val bytes = ByteBuffer.allocate(buf.size * 2).order(ByteOrder.LITTLE_ENDIAN)
             RandomAccessFile(outFile, "rw").use { raf ->
                 raf.setLength(0)
                 raf.write(ByteArray(44)) // header placeholder, patched on stop
@@ -60,7 +61,7 @@ class WavRecorder(
                         sum += s * s
                     }
                     onAmplitude((sqrt(sum / n) / 32768.0).toFloat())
-                    val bytes = ByteBuffer.allocate(n * 2).order(ByteOrder.LITTLE_ENDIAN)
+                    bytes.clear()
                     for (i in 0 until n) bytes.putShort(buf[i])
                     raf.write(bytes.array(), 0, n * 2)
                     total += n * 2

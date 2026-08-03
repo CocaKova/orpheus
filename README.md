@@ -12,9 +12,9 @@ it back. Nothing leaves your network.
 
 | Piece | Status | What it is |
 |---|---|---|
-| `server/` | working | OpenAI-compatible `/v1/audio/transcriptions` endpoint: Parakeet TDT ASR + optional LLM cleanup pass |
-| `desktop/` | notes | use [Handy](https://github.com/cjpais/Handy) (open-source, hotkey-to-type) locally, or point any OpenAI-compatible dictation client at the server |
-| `android/` | working | floating dictation bubble + dashboard app — appears whenever a keyboard opens, pastes into any app |
+| `server/` | stable | OpenAI-compatible `/v1/audio/transcriptions` endpoint: Parakeet TDT ASR + optional LLM cleanup pass |
+| `desktop/` | docs | use [Handy](https://github.com/cjpais/Handy) (open-source, hotkey-to-type) locally, or point any OpenAI-compatible dictation client at the server — see `desktop/README.md` |
+| `android/` | stable | floating dictation bubble + dashboard app — appears whenever a keyboard opens, pastes into any app |
 
 Because the endpoint speaks the OpenAI transcription API, any client with a
 configurable STT URL works out of the box — point it at
@@ -49,6 +49,11 @@ transcription — dictation never blocks on the polish.
 
 A sample systemd user unit is in `server/orpheus.service`.
 
+Optional hardening (all off by default, see the docstring in
+`orpheus_server.py` for the full list): set `ORPHEUS_API_KEY` to require a
+bearer token on `/v1/*`. Transcript text stays out of the server logs unless
+you set `ORPHEUS_LOG_TEXT=true`.
+
 ## Android app
 
 A standalone dictation app (`android/`) in the spirit of Wispr Flow:
@@ -63,11 +68,20 @@ A standalone dictation app (`android/`) in the spirit of Wispr Flow:
   device.
 - **Universal STT** — same OpenAI-compatible client as everything else here:
   point it at your Orpheus server, or OpenAI, or Groq, with optional API key
-  and model fields.
+  and model fields. A test-connection button tells you the setup works before
+  you ever dictate, and a "skip AI cleanup" switch pastes the raw
+  transcription instead of the polished one.
 
-Build: `cd android && ./gradlew assembleDebug` (APK lands in
-`app/build/outputs/apk/debug/`). No Google services, no analytics, no
+Install the APK from the [latest release](https://github.com/CocaKova/orpheus/releases),
+or build it yourself: `cd android && ./gradlew assembleRelease` (APK lands in
+`app/build/outputs/apk/release/`). No Google services, no analytics, no
 permissions beyond mic + the accessibility service you explicitly enable.
+
+**Why an accessibility service?** It's how the bubble knows a keyboard opened
+and how the transcript lands in the focused text field of *other* apps — the
+whole point of system-wide dictation. Orpheus reads nothing from your screen;
+transcripts and word counts live in a local file on the device, backup is
+disabled so they never leave it, and the clipboard entry is flagged sensitive.
 
 ## License
 
