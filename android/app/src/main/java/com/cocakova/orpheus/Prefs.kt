@@ -20,6 +20,11 @@ class Prefs(context: Context) {
         get() = sp.getString("stt_model", "") ?: ""
         set(v) = sp.edit().putString("stt_model", v).apply()
 
+    /** Skip the server's LLM cleanup pass and paste raw ASR output. */
+    var rawMode: Boolean
+        get() = sp.getBoolean("raw_mode", false)
+        set(v) = sp.edit().putBoolean("raw_mode", v).apply()
+
     var bubbleX: Int
         get() = sp.getInt("bubble_x", -1)
         set(v) = sp.edit().putInt("bubble_x", v).apply()

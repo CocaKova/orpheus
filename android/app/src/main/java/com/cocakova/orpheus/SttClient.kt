@@ -31,11 +31,30 @@ class SttClient(baseUrl: String, private val apiKey: String) {
         .writeTimeout(120, TimeUnit.SECONDS)
         .build()
 
-    fun transcribe(audio: File, model: String): String {
+    /**
+     * Reachability check against GET /v1/models — served by every
+     * OpenAI-compatible endpoint. Returns the first model id (may be empty).
+     */
+    fun testConnection(): String {
+        val request = Request.Builder()
+            .url(endpoint.removeSuffix("/audio/transcriptions") + "/models")
+            .apply { if (apiKey.isNotBlank()) header("Authorization", "Bearer $apiKey") }
+            .get()
+            .build()
+        client.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+            return JSONObject(resp.body?.string().orEmpty())
+                .optJSONArray("data")?.optJSONObject(0)?.optString("id").orEmpty()
+        }
+    }
+
+    fun transcribe(audio: File, model: String, raw: Boolean = false): String {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("file", audio.name, audio.asRequestBody("audio/wav".toMediaType()))
             .addFormDataPart("response_format", "json")
             .apply { if (model.isNotBlank()) addFormDataPart("model", model) }
+            // Orpheus extension; only sent when the user opts out of cleanup
+            .apply { if (raw) addFormDataPart("clean", "false") }
             .build()
         val request = Request.Builder()
             .url(endpoint)

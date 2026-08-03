@@ -1,8 +1,6 @@
 package com.cocakova.orpheus
 
 import android.Manifest
-import android.content.ClipData
-import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -34,6 +32,7 @@ import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -41,6 +40,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.darkColorScheme
@@ -50,6 +50,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,6 +64,9 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Calendar
 import java.util.Date
@@ -98,6 +102,10 @@ fun OrpheusApp() {
     var sttUrl by remember { mutableStateOf(prefs.sttUrl) }
     var sttApiKey by remember { mutableStateOf(prefs.sttApiKey) }
     var sttModel by remember { mutableStateOf(prefs.sttModel) }
+    var rawMode by remember { mutableStateOf(prefs.rawMode) }
+    var testing by remember { mutableStateOf(false) }
+    var confirmClear by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     // Refresh permission states + history whenever we come back to the foreground
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -214,16 +222,73 @@ fun OrpheusApp() {
                                 singleLine = true,
                                 modifier = Modifier.fillMaxWidth(),
                             )
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text(
+                                        "Skip AI cleanup",
+                                        style = MaterialTheme.typography.bodyMedium,
+                                    )
+                                    Text(
+                                        "Paste the raw transcription, unpolished (Orpheus servers only)",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                                Switch(
+                                    checked = rawMode,
+                                    onCheckedChange = {
+                                        rawMode = it
+                                        prefs.rawMode = it
+                                    },
+                                )
+                            }
+                            TextButton(
+                                enabled = !testing && sttUrl.isNotBlank(),
+                                onClick = {
+                                    testing = true
+                                    scope.launch {
+                                        val result = withContext(Dispatchers.IO) {
+                                            runCatching {
+                                                SttClient(prefs.sttUrl, prefs.sttApiKey)
+                                                    .testConnection()
+                                            }
+                                        }
+                                        testing = false
+                                        result.onSuccess { id ->
+                                            Toast.makeText(
+                                                context,
+                                                if (id.isBlank()) "Connected"
+                                                else "Connected — $id",
+                                                Toast.LENGTH_SHORT,
+                                            ).show()
+                                        }.onFailure { e ->
+                                            Toast.makeText(
+                                                context,
+                                                "Failed: ${e.message}",
+                                                Toast.LENGTH_LONG,
+                                            ).show()
+                                        }
+                                    }
+                                },
+                            ) { Text(if (testing) "Testing…" else "Test connection") }
                         }
                     }
                 }
 
                 item {
-                    Text(
-                        "History",
-                        style = MaterialTheme.typography.titleMedium,
-                        modifier = Modifier.padding(top = 4.dp),
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                    ) {
+                        Text(
+                            "History",
+                            style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (entries.isNotEmpty()) {
+                            TextButton(onClick = { confirmClear = true }) { Text("Clear") }
+                        }
+                    }
                 }
 
                 if (entries.isEmpty()) {
@@ -237,13 +302,29 @@ fun OrpheusApp() {
                 } else {
                     items(entries.asReversed()) { entry ->
                         TranscriptCard(entry) {
-                            val cm = context.getSystemService(Context.CLIPBOARD_SERVICE)
-                                as ClipboardManager
-                            cm.setPrimaryClip(ClipData.newPlainText("Orpheus", entry.text))
+                            copyToClipboard(context, entry.text)
                             Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
                         }
                     }
                 }
+            }
+
+            if (confirmClear) {
+                AlertDialog(
+                    onDismissRequest = { confirmClear = false },
+                    title = { Text("Clear history?") },
+                    text = { Text("Deletes every saved transcript and resets the word counts. This can't be undone.") },
+                    confirmButton = {
+                        TextButton(onClick = {
+                            log.clear()
+                            entries = emptyList()
+                            confirmClear = false
+                        }) { Text("Clear") }
+                    },
+                    dismissButton = {
+                        TextButton(onClick = { confirmClear = false }) { Text("Cancel") }
+                    },
+                )
             }
         }
     }
