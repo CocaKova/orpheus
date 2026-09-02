@@ -1,0 +1,4 @@
+requests>=2.31
+numpy>=1.24
+sounddevice>=0.4.6   # needs portaudio; on Linux without it the client falls back to arecord
+pynput>=1.7.6        # global hotkey + Ctrl+V on Windows/X11 (not used on Wayland)

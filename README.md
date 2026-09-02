@@ -13,8 +13,8 @@ it back. Nothing leaves your network.
 | Piece | Status | What it is |
 |---|---|---|
 | `server/` | stable | OpenAI-compatible `/v1/audio/transcriptions` endpoint: Parakeet TDT ASR + optional LLM cleanup pass |
-| `desktop/` | docs | use [Handy](https://github.com/cjpais/Handy) (open-source, hotkey-to-type) locally, or point any OpenAI-compatible dictation client at the server — see `desktop/README.md` |
-| `android/` | stable | floating dictation bubble + dashboard app — appears whenever a keyboard opens, pastes into any app |
+| `desktop/` | new | single-file push-to-talk client for Windows and Linux: hotkey, record, paste into whatever has focus — see `desktop/README.md` |
+| `android/` | stable | floating dictation orb + dashboard app — appears whenever a keyboard opens, inserts at the cursor in any app |
 
 Because the endpoint speaks the OpenAI transcription API, any client with a
 configurable STT URL works out of the box — point it at
@@ -70,14 +70,26 @@ you set `ORPHEUS_LOG_TEXT=true`.
 
 A standalone dictation app (`android/`) in the spirit of Wispr Flow:
 
-- **Floating bubble** — an accessibility service watches for the keyboard
-  opening in *any* app and floats a draggable Orpheus bubble beside it. Tap to
-  record (live waveform), tap again to stop — or press-and-hold to record only
-  while held. The transcript is copied to the clipboard and pasted straight
-  into the focused text field.
-- **Dashboard** — words dictated today / this week / all time, plus a local
-  history of every transcript (tap to re-copy, long-press to delete, export
-  via the share sheet). Transcripts age out after 30 days by default —
+- **The orb** — an accessibility service watches for the keyboard opening
+  in *any* app and floats a draggable glass orb beside it. Tap to record (the
+  glow follows your voice), tap again to stop — or press-and-hold to record
+  only while held. The transcript lands at the cursor of the focused field,
+  spaced to fit the words around it, with a green check and a tick of haptics
+  when it does. It snaps to the screen edge after a drag and rests dim when
+  idle.
+- **Context-aware** — the words next to your cursor and the app you're in
+  travel with the audio, so the server starts lowercase mid-sentence, skips
+  the trailing period on a one-line chat message, and treats terminal input
+  as literal commands. A personal dictionary in Settings rides along too.
+- **Nothing is lost** — if the server is reloading or unreachable, the
+  recording is kept: the orb turns amber, a tap retries, a hold records
+  fresh, and the dashboard offers the same take with Retry / Discard. Server
+  restarts (HTTP 503) are retried automatically for up to 40 s.
+- **Dashboard** — a live preview of the orb, words dictated today / this
+  week / all time with the time saved over typing, plus a local history of
+  every transcript with the app it went into and what the recognizer heard
+  before cleanup (tap to re-copy, long-press to delete, export via the share
+  sheet). Transcripts age out after 30 days by default —
   configurable from 7 days to forever, or off entirely — while the word-count
   stats are kept for good. The log never leaves the device.
 - **Universal STT** — same OpenAI-compatible client as everything else here:
@@ -91,9 +103,12 @@ or build it yourself: `cd android && ./gradlew assembleRelease` (APK lands in
 `app/build/outputs/apk/release/`). No Google services, no analytics, no
 permissions beyond mic + the accessibility service you explicitly enable.
 
-**Why an accessibility service?** It's how the bubble knows a keyboard opened
+**Why an accessibility service?** It's how the orb knows a keyboard opened
 and how the transcript lands in the focused text field of *other* apps — the
-whole point of system-wide dictation. Orpheus reads nothing from your screen;
+whole point of system-wide dictation. Orpheus reads only the text around your
+cursor in the field you're dictating into (and only when "match the text
+around the cursor" is on), sends it to your server with the audio, and stores
+none of it;
 transcripts and word counts live in a local file on the device, backup is
 disabled so they never leave it, and the clipboard entry is flagged sensitive.
 
