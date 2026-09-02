@@ -39,6 +39,18 @@ curl -s http://localhost:8123/v1/audio/transcriptions \
   -F file=@recording.m4a -F response_format=verbose_json
 ```
 
+Spoken symbols are honoured: "open paren", "new line", "exclamation point",
+"underscore", "slash", "dash dash", "quote … end quote", "smiley face" and the
+rest of the usual dictation vocabulary become the symbols themselves in a
+deterministic pre-pass (see `server/formatting.py`). The LLM pass then handles
+the context-dependent ones ("jonny at example dot com" → `jonny@example.com`,
+"hashtag local peer" → `#localpeer`), turns spoken code and prices into
+`get_user(user_id)` and `$25.50`, strips fillers, applies self-corrections and
+fixes casing. A content guard compares the model's answer with what was said
+and falls back to the pre-passed text if the model dropped anything, so a
+cleanup pass can never lose your words. Set `ORPHEUS_DICTIONARY="Jonny, Keryx,
+DGX Spark"` to teach it the names it keeps mishearing.
+
 Any audio format ffmpeg can read is accepted. `clean=false` skips the LLM
 polish and returns raw ASR output.
 

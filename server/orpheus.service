@@ -7,6 +7,8 @@ Type=simple
 WorkingDirectory=%h/workspace/orpheus/server
 Environment=ORPHEUS_PORT=8123
 Environment=ORPHEUS_CLEAN_URL=http://127.0.0.1:8000/v1
+# names and terms the cleanup pass should spell correctly (optional)
+#Environment="ORPHEUS_DICTIONARY=Your Name, Product, Project"
 ExecStart=%h/workspace/orpheus/server/.venv/bin/python orpheus_server.py
 Restart=on-failure
 RestartSec=5
