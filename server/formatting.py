@@ -7,6 +7,12 @@ The pre-pass is deterministic and only rewrites tokens that are unambiguous
 when spoken ("new line", "open paren", "exclamation point"). Words that are
 also ordinary English ("at", "dot", "dash", "hash", "period" mid-sentence)
 are left for the LLM, which sees the surrounding sentence.
+
+Lists get three layers: spoken markers ("bullet point", "number one") are
+rewritten here; the LLM is asked to lay out anything the speaker enumerates
+(needs, steps, options) one item per line; and listify() is a deterministic
+fallback for the plainest shape ("I need eggs, milk, bread and cheese") so
+that shape formats the same way whether or not the LLM pass ran.
 """
 
 import difflib
@@ -95,6 +101,96 @@ def _retract(text: str) -> str:
         text = (text[:cut].rstrip() + " " + rest).strip()
 
 
+# ------------------------------------------------------------ list markers
+#
+# "bullet point eggs bullet point milk" -> "- eggs\n- milk"
+# "number one, finish the report. Number two, send it." -> "1. ...\n2. ..."
+# A marker only counts where a speaker would put one: "the number one
+# priority" and "add a bullet point" are prose and stay.
+
+_BULLET_MARK = re.compile(
+    r"[,.;:]?\s*\b(?:bullet point|new bullet|next bullet|next item|next point)\b[,.:]?\s*", _I)
+_NUMBER_MARK = re.compile(
+    r"[,.;:]?\s*\bnumber (one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|\d{1,2})\b([,.:]?)\s*", _I)
+_MARK_DETERMINER = re.compile(
+    r"\b(?:a|an|the|each|every|another|this|that|per|as|add|make|with|into|my|our|your|his|her|their)\s*$", _I)
+_DIGITS = {w: str(i) for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen fourteen "
+    "fifteen sixteen seventeen eighteen nineteen twenty".split())}
+
+
+def _after_determiner(text: str, m) -> bool:
+    """'add a bullet point' — a determiner right before the marker, with no
+    pause between, means the words are prose."""
+    if m.group(0).lstrip()[:1] in ",.;:":
+        return False
+    return bool(_MARK_DETERMINER.search(text[:m.start()]))
+
+
+def _list_markers(text: str) -> str:
+    def bullet(m):
+        if _after_determiner(text, m):
+            return m.group(0)
+        return "\n- "
+
+    def number(m):
+        head = text[:m.start()].rstrip()
+        anchored = not head or head[-1] in ".,;:!?\n" or bool(m.group(2))
+        if not anchored or _after_determiner(text, m):
+            return m.group(0)
+        n = m.group(1).lower()
+        return "\n" + _DIGITS.get(n, n) + ". "
+
+    text = _BULLET_MARK.sub(bullet, text)
+    return _NUMBER_MARK.sub(number, text)
+
+
+_ITEM_LINE = re.compile(r"^(?P<mark>[-*•] |\d{1,2}[.)] )(?P<body>.*)$")
+_INLINE_NUM = re.compile(r"(?:(?<=^)|(?<=\s))(\d{1,2})\. (?=\S)")
+
+
+def _inline_numbering(text: str) -> str:
+    """The recognizer writes a counted-off list inline: 'are 1. Finish the
+    report 2. Send it'. A run 1. 2. 3. … in order becomes one item per line;
+    a stray 'Python 3. Restart' has no 1. before it and stays."""
+    if "\n" in text:
+        return text
+    marks = list(_INLINE_NUM.finditer(text))
+    if len(marks) < 2 or [int(m.group(1)) for m in marks] != list(range(1, len(marks) + 1)):
+        return text
+    out, last = [], 0
+    for m in marks:
+        out.append(text[last:m.start()].rstrip())
+        last = m.start()
+    out.append(text[last:])
+    return "\n".join(x for x in out if x)
+
+
+def _tidy_lists(text: str) -> str:
+    """Capitalise items, drop their trailing period, end the lead-in line
+    with a colon. Runs on anything that has list lines, whoever made them."""
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        m = _ITEM_LINE.match(line)
+        if not m:
+            continue
+        body = m.group("body").strip()
+        if body:
+            body = body[0].upper() + body[1:]
+        if body.endswith(".") and not body.endswith("..") and not re.search(r"[.!?]\s+\S", body):
+            body = body[:-1]
+        lines[i] = m.group("mark") + body
+        prev = lines[i - 1].rstrip() if i else ""
+        if prev and not _ITEM_LINE.match(prev):
+            if prev.endswith(","):
+                prev = prev[:-1] + ":"
+            elif prev[-1] not in ".!?:":
+                prev += ":"
+            lines[i - 1] = prev
+    return "\n".join(lines)
+
+
 _TIDY = [
     (re.compile(r"\(\s+"), "("),
     (re.compile(r"\s+\)"), ")"),
@@ -139,9 +235,12 @@ def prepass(text: str, aliases: list[tuple[re.Pattern, str]] = (), capitalize: b
         text = rx.sub(meant, text)
     for rx, rep in _COMPILED:
         text = rx.sub(rep, text)
+    text = _list_markers(text)
+    text = _inline_numbering(text)
     text = _retract(text)
     for rx, rep in _TIDY:
         text = rx.sub(rep, text)
+    text = _tidy_lists(text)
     # a sentence that now starts after a line break should be capitalised
     text = re.sub(r"(^|\n)([a-z])" if capitalize else r"(\n)([a-z])",
                   lambda m: m.group(1) + m.group(2).upper(), text)
@@ -162,7 +261,7 @@ RULES
 4. Spoken symbol names that are still words become symbols: "dot"->".", "at"->"@" only inside an email address, "hashtag word"->#word (joined), "dash"->"-", "hyphen"->"-", "colon"->":", "comma"->",", "equals"->"=", "plus"->"+", "star"->"*", "hash"->"#".
 5. Spoken code, paths, commands and addresses become literal: "get user (user id)"->get_user(user_id); "jonny at example dot com"->jonny@example.com; "npm --version" stays; "/home/jon" stays.
 6. Numbers: prices, percents, times, dates, versions become digits ($25.50, 10%, 6pm, 09-01, v2.6.2). Small counts in prose stay words.
-7. Sequence words ("first... second..." / "one... two...") on separate thoughts become a list, one item per line.
+7. LISTS. When the speaker enumerates a set of things — items they need, tasks, steps, options, names — lay it out as a list: the lead-in on its own line ending with a colon, then one item per line. Use "- " bullets for unordered items; use "1." "2." numbering when the speaker counted them ("first... second...", "one... two...", "number one...", "step one..."). Each item starts with a capital and has no trailing period. Do this for three or more items, or whenever the speaker counted. Two things joined by "and" stay a sentence, and items that sit inside a longer sentence (more sentence follows them) stay inline. Keep list lines that are already in the text.
 8. Output ONLY the formatted text. No quotes around it, no commentary, no preamble.
 9. A request may start with STYLE / CONTEXT lines before "DICTATION:". Obey them, never repeat the context, and format only the dictation.
 {dictionary}
@@ -179,6 +278,25 @@ in: hashtag local peer is live at eight tonight!
 out: #localpeer is live at 8 tonight!
 in: pick up the dry cleaning, scratch that, the cleaners are closed on Mondays
 out: The cleaners are closed on Mondays.
+in: my top goals this week are one finish the report two send the presentation three book the flights
+out: My top goals this week are:
+1. Finish the report
+2. Send the presentation
+3. Book the flights
+in: okay so from the store I need eggs milk bread and um cheese
+out: From the store I need:
+- Eggs
+- Milk
+- Bread
+- Cheese
+in: first back up the database then run the migration and finally restart the gateway
+out: 1. Back up the database
+2. Run the migration
+3. Restart the gateway
+in: grab me a coffee and a bagel on your way in
+out: Grab me a coffee and a bagel on your way in.
+in: we tested eggs, milk and bread and all three were fine
+out: We tested eggs, milk and bread and all three were fine.
 in: STYLE: chat message — relaxed; a single short sentence gets no trailing period.
 CONTEXT: the text is inserted right after this existing text (do not repeat or continue it):
 «Running late,»
@@ -217,6 +335,10 @@ _NUMBER_WORDS = {
     "forty", "fifty", "sixty", "seventy", "eighty", "ninety", "hundred",
     "thousand", "million", "billion", "half", "quarter", "dollars", "dollar",
     "cents", "cent", "percent", "oclock", "am", "pm", "point", "and",
+    # counting words the model may turn into list numbering
+    "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
+    "eighth", "ninth", "tenth", "next", "then", "finally", "lastly", "also",
+    "number", "step", "item", "bullet",
 }
 # spoken names the LLM is allowed to turn into symbols (rule 4)
 _SYMBOL_WORDS = {
@@ -383,3 +505,76 @@ def fit_context(text: str, before: str, style: str, dictionary_words=()) -> str:
                 and not re.search(r"[.!?]\s+\S", body) and "\n" not in body:
             text = body[:-1]
     return text
+
+
+# ----------------------------------------------------------------- listify
+#
+# Deterministic fallback for the plainest spoken list: a lead-in that
+# announces things ("I need", "grab me", "to-do list") followed by three or
+# more short comma-separated items. The LLM handles every other shape;
+# this one is common enough that it should come out the same every time,
+# LLM or not.
+
+_LIST_LEAD = re.compile(
+    r"^(?P<lead>(?:(?:okay|ok|so|um|uh|alright|right)[,.]?\s+)*"
+    r"(?:"
+    # "from the store I need", "for the trip we'll need": a short clause may lead
+    r"(?:[a-z' ]{0,30}?\s)?(?:i|we|you)(?:'ll| will| also| still)? need(?: to (?:get|grab|buy|pick up|do))?"
+    r"|(?:things|stuff|what) (?:i|we|you) need(?: to (?:get|grab|buy|do))?"
+    r"|(?:things|stuff) to (?:do|get|buy|grab)"
+    r"|(?:my |our |the )?(?:to[- ]?do|shopping|grocery|packing|reading) list(?: is| for [a-z]+)?"
+    r"|(?:please )?(?:grab|get|buy|bring)(?: me| us)?"
+    r"|(?:please )?pick up"
+    r"|remind me to (?:get|grab|buy|pick up)"
+    r"|don't forget"
+    r")"
+    r"(?:\s+(?:from|at|for|on|before|after|tomorrow|today|tonight)\b[^,:]{0,40}?)?"
+    r"(?: the following| these(?: things| items)?| a few things| some (?:things|stuff|items))?"
+    r")(?:\s*:|,)?\s+(?P<items>.+?)\s*$", _I)
+_ITEM_SPLIT = re.compile(r"\s*[,;]\s*")
+_ITEM_LEAD = re.compile(r"^(?:and|or|also|plus|then)\s+", _I)
+_BAD_ITEM_START = re.compile(
+    r"^(?:you|me|us|them|him|her|it|that|this|these|those|to|if|when|because|but|which|who)\b", _I)
+MIN_LIST_ITEMS = 3
+MAX_ITEM_WORDS = 6
+
+
+def _split_items(items: str) -> list[str]:
+    parts = [p for p in _ITEM_SPLIT.split(items) if p.strip()]
+    if not parts:
+        return []
+    # "bread and cheese" at the end -> two items; "salt and pepper" mid-list stays one
+    last = parts[-1]
+    m = re.match(r"^(?P<a>.+?)\s+(?:and|or)\s+(?P<b>.+)$", last, _I)
+    if m and len(parts) >= 2 and not _ITEM_LEAD.match(last):
+        parts[-1:] = [m.group("a"), m.group("b")]
+    out = []
+    for p in parts:
+        p = _ITEM_LEAD.sub("", p.strip()).strip()
+        out.append(p)
+    return out
+
+
+def listify(text: str) -> str:
+    """'I need eggs, milk, bread and cheese.' ->
+    'I need:\n- Eggs\n- Milk\n- Bread\n- Cheese'. Anything else returns unchanged."""
+    if not text or "\n" in text:
+        return text
+    body = text.strip()
+    if body.endswith((".", "!")):
+        body = body[:-1]
+    if re.search(r"[.!?]\s+\S", body):      # more than one sentence: not a bare list
+        return text
+    m = _LIST_LEAD.match(body)
+    if not m:
+        return text
+    items = _split_items(m.group("items"))
+    if len(items) < MIN_LIST_ITEMS:
+        return text
+    if any(not it or len(it.split()) > MAX_ITEM_WORDS or re.search(r"[.!?:]", it) for it in items):
+        return text
+    if _BAD_ITEM_START.match(items[0]):
+        return text
+    lead = m.group("lead").strip()
+    lead = lead[0].upper() + lead[1:]
+    return _tidy_lists(lead + ":\n" + "\n".join("- " + it for it in items))

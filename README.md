@@ -51,6 +51,14 @@ and falls back to the pre-passed text if the model dropped anything, so a
 cleanup pass can never lose your words. Set `ORPHEUS_DICTIONARY="Jonny, Keryx,
 DGX Spark"` to teach it the names it keeps mishearing.
 
+Lists come out as lists. Name the things you need ("from the store I need
+eggs, milk, bread and cheese"), count them off ("first… second…", "number
+one…", "step one…") or say "bullet point" between items, and Orpheus writes
+the lead-in on its own line with a colon and one item per line — bullets for
+a plain set, `1.` `2.` when you counted. Two things joined by "and" stay a
+sentence, and so does a list buried inside a longer one. Terminal-style
+targets (`style=code`) never get list formatting.
+
 Any audio format ffmpeg can read is accepted. `clean=false` skips the LLM
 polish and returns raw ASR output.
 
