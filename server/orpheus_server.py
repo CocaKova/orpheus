@@ -2,9 +2,12 @@
 
 OpenAI-compatible speech-to-text server wrapping NVIDIA Parakeet TDT,
 with a deterministic spoken-symbol pre-pass ("open paren", "new line",
-"exclamation point" -> symbols) and an optional LLM cleanup pass (fillers,
-punctuation, casing, code/paths/numbers, personal dictionary) via any
-OpenAI-compatible chat endpoint running on the same box. A content guard
+"exclamation point", "bullet point", "number one" -> symbols and list
+lines) and an optional LLM cleanup pass (fillers, punctuation, casing,
+code/paths/numbers, personal dictionary, spoken enumerations laid out as
+lists) via any OpenAI-compatible chat endpoint running on the same box. A
+plain "I need eggs, milk, bread and cheese" becomes a bulleted list with or
+without the LLM (formatting.listify). A content guard
 rejects LLM output that dropped what the speaker said and falls back to the
 pre-passed text.
 
@@ -47,7 +50,7 @@ import formatting
 from fastapi import FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 
 MODEL_NAME = os.environ.get("ORPHEUS_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
 CLEAN_DEFAULT = os.environ.get("ORPHEUS_CLEAN_DEFAULT", "true").lower() == "true"
@@ -246,6 +249,8 @@ async def transcriptions(
             text, guard_note = await cleanup_pass(pre, hints)
         else:
             text = pre
+        if style != "code" and not formatting.mid_sentence(context_before):
+            text = formatting.listify(text)
         text = formatting.fit_context(text, context_before, style, DICT_WORDS + extra_words)
         t_total = time.time() - t0
         # transcripts are private — log content only when explicitly asked to

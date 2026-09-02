@@ -91,3 +91,47 @@ eq(prepass("git status.", capitalize=False), "git status.")
 eq(prepass("i think so", capitalize=False), "i think so")
 eq(prepass("I think so", capitalize=False), "I think so")
 print("context ok")
+
+# --- lists: spoken markers, tidy, deterministic fallback
+from formatting import listify
+eq(prepass("I need the following. Bullet point eggs, bullet point milk, bullet point a loaf of bread."),
+   "I need the following:\n- Eggs\n- Milk\n- A loaf of bread")
+eq(prepass("Things to pack, bullet point charger, bullet point passport."),
+   "Things to pack:\n- Charger\n- Passport")
+eq(prepass("Number one, finish the report. Number two, send it. Number three, book the flights."),
+   "1. Finish the report\n2. Send it\n3. Book the flights")
+eq(prepass("Goals for the week. Number one, ship it. Number two, rest."),
+   "Goals for the week:\n1. Ship it\n2. Rest")
+eq(prepass("add a bullet point here and the number one priority is sleep"),
+   "Add a bullet point here and the number one priority is sleep")   # prose stays prose
+eq(prepass("she wore number seven and bullet points are ugly"), "She wore number seven and bullet points are ugly")
+eq(prepass("bullet point one, bullet point two"), "- One\n- Two")     # no lead-in: no colon invented
+eq(listify("Okay so from the store I need eggs, milk, bread and cheese."),
+   "Okay so from the store I need:\n- Eggs\n- Milk\n- Bread\n- Cheese")
+eq(listify("Grab me a coffee, a bagel and the paper."), "Grab me:\n- A coffee\n- A bagel\n- The paper")
+eq(listify("To-do list for tomorrow: call the bank, renew the plates, pick up the dry cleaning."),
+   "To-do list for tomorrow:\n- Call the bank\n- Renew the plates\n- Pick up the dry cleaning")
+eq(listify("For the trip we'll need sunscreen, hats, salt and pepper, and towels."),
+   "For the trip we'll need:\n- Sunscreen\n- Hats\n- Salt and pepper\n- Towels")   # inner "and" kept
+eq(listify("I need eggs and milk."), "I need eggs and milk.")                        # two things = sentence
+eq(listify("I need you to call mom, walk the dog, and buy milk."), "I need you to call mom, walk the dog, and buy milk.")
+eq(listify("We tested eggs, milk and bread and all three were fine."), "We tested eggs, milk and bread and all three were fine.")
+eq(listify("I need eggs, milk, bread. Also call mom."), "I need eggs, milk, bread. Also call mom.")   # two sentences
+eq(listify("When you get home, take out the trash, feed the cat."), "When you get home, take out the trash, feed the cat.")
+eq(listify("- Eggs\n- Milk"), "- Eggs\n- Milk")                                       # already a list
+eq(listify(""), "")
+ok, _ = guard("first back up the database then run the migration and finally restart the gateway",
+              "1. Back up the database\n2. Run the migration\n3. Restart the gateway")
+assert ok, "sequence words may become numbering"
+ok, _ = guard("step one open the app step two tap the orb step three speak step four stop",
+              "1. Open the app\n2. Tap the orb\n3. Speak\n4. Stop")
+assert ok
+print("list tests pass")
+
+# --- recognizer-written inline numbering
+eq(prepass("My top goals this week are 1. Finish the report 2. Send the presentation 3. Book the flights."),
+   "My top goals this week are:\n1. Finish the report\n2. Send the presentation\n3. Book the flights")
+eq(prepass("1. Back up 2. Migrate 3. Restart."), "1. Back up\n2. Migrate\n3. Restart")
+eq(prepass("We moved to Python 3. Restart the gateway after."), "We moved to Python 3. Restart the gateway after.")
+eq(prepass("Chapter 2. Then chapter 4. Done."), "Chapter 2. Then chapter 4. Done.")   # not a 1-2-3 run
+print("inline numbering tests pass")
