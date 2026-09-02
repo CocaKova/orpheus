@@ -1,0 +1,74 @@
+name: desktop-windows
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to upload OrpheusDesktop.exe to (leave empty to only build)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build OrpheusDesktop.exe
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+        shell: pwsh
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller OrpheusDesktop.spec
+
+      - name: Smoke test
+        run: |
+          $exe = Resolve-Path dist\OrpheusDesktop.exe
+          $log = Join-Path $env:LOCALAPPDATA 'Orpheus\orpheus-desktop.log'
+          $ver = (Select-String -Path orpheus_desktop.py -Pattern '^VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          # windowed exe: no stdout, so read the log file it writes instead
+          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "--version exited $($p.ExitCode)" }
+          $p = Start-Process -FilePath $exe -ArgumentList 'status' -Wait -PassThru
+          if ($p.ExitCode -ne 1) { throw "status exited $($p.ExitCode), expected 1 (no daemon)" }
+          Get-Content $log
+          if (-not (Select-String -Path $log -Pattern "orpheus desktop $ver" -Quiet)) { throw "version line missing from $log" }
+          if (-not (Select-String -Path $log -Pattern 'daemon not running' -Quiet)) { throw "status line missing from $log" }
+          "exe size: $((Get-Item $exe).Length / 1MB) MB"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrpheusDesktop
+          path: desktop/dist/OrpheusDesktop.exe
+          if-no-files-found: error
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
+          gh release view $tag --repo $env:REPO *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --repo $env:REPO --title "Orpheus $($tag.TrimStart('v'))" --notes "Windows desktop client build." --verify-tag
+          }
+          gh release upload $tag dist/OrpheusDesktop.exe --repo $env:REPO --clobber

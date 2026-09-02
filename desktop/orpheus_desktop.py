@@ -6,6 +6,8 @@ Orpheus desktop — push-to-talk dictation for Windows and Linux.
     python orpheus_desktop.py toggle          # start/stop from a shortcut (Wayland)
     python orpheus_desktop.py start | stop | status | quit
     python orpheus_desktop.py transcribe clip.wav
+    python orpheus_desktop.py install         # start at login (Task Manager → Startup apps)
+    python orpheus_desktop.py uninstall
     python orpheus_desktop.py --setup         # write the config template
 
 Press the hotkey, talk, press it again (or release it in hold-to-talk mode).
@@ -14,7 +16,8 @@ is pasted into whatever has focus. Nothing is stored except a failed take,
 which is saved so it is never lost.
 
 Required:  requests, numpy, sounddevice, pynput   (see requirements.txt)
-Optional:  arecord (Linux mic fallback when portaudio is missing),
+Optional:  pystray + Pillow (tray icon; headless daemon without them),
+           arecord (Linux mic fallback when portaudio is missing),
            wl-copy/wl-paste or xclip/xsel, wtype or ydotool (Wayland paste),
            notify-send, paplay/aplay.
 """
@@ -44,11 +47,13 @@ IS_WAYLAND = IS_LINUX and (os.environ.get("XDG_SESSION_TYPE") == "wayland"
                            or bool(os.environ.get("WAYLAND_DISPLAY")))
 HAS_DISPLAY = IS_WIN or bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
 
+DEFAULT_HOTKEY = "<cmd>+h" if IS_WIN else "<ctrl>+<alt>+<space>"
+
 DEFAULTS = {
     "url": "http://localhost:8123",
     "api_key": "",
     "model": "",
-    "hotkey": "<ctrl>+<alt>+space",
+    "hotkey": DEFAULT_HOTKEY,
     "hold_to_talk": False,
     "paste": True,
     "restore_clipboard": True,
@@ -73,7 +78,8 @@ model = ""
 
 # Global hotkey (pynput syntax). Windows and X11 only; on Wayland bind
 # `orpheus_desktop.py toggle` as a system shortcut instead.
-hotkey = "<ctrl>+<alt>+space"
+# Windows default <cmd>+h = Win+H, which replaces Windows voice typing.
+hotkey = "@HOTKEY@"
 
 # false = press once to start, again to stop.  true = record while held.
 hold_to_talk = false
@@ -102,8 +108,29 @@ control_port = 47123
 """
 
 
+_LOG_FILE: Path | None = None
+
+
 def log(msg: str) -> None:
-    print(f"[orpheus] {msg}", flush=True)
+    line = f"[orpheus] {msg}"
+    if sys.stdout is not None:
+        print(line, flush=True)
+    if sys.stdout is None or getattr(sys, "frozen", False):
+        _log_to_file(line)
+
+
+def _log_to_file(line: str) -> None:
+    """No console (pythonw / the exe): append to the log file instead."""
+    global _LOG_FILE
+    try:
+        if _LOG_FILE is None:
+            _LOG_FILE = cache_dir() / "orpheus-desktop.log"
+            if _LOG_FILE.exists() and _LOG_FILE.stat().st_size > 1_000_000:
+                _LOG_FILE.replace(_LOG_FILE.with_suffix(".log.1"))
+        with open(_LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {line}\n")
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------ config
@@ -128,7 +155,7 @@ def cache_dir() -> Path:
 
 def write_template(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(CONFIG_TEMPLATE, encoding="utf-8")
+    path.write_text(CONFIG_TEMPLATE.replace("@HOTKEY@", DEFAULT_HOTKEY), encoding="utf-8")
     log(f"wrote config template: {path}")
 
 
@@ -350,9 +377,7 @@ class SttClient:
 
 
 def save_failed_take(wav: bytes) -> Path:
-    d = cache_dir() / "failed"
-    d.mkdir(parents=True, exist_ok=True)
-    p = d / f"take-{datetime.now():%Y%m%d-%H%M%S}.wav"
+    p = failed_dir() / f"take-{datetime.now():%Y%m%d-%H%M%S}.wav"
     p.write_bytes(wav)
     return p
 
@@ -597,6 +622,16 @@ class Daemon:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.started_at = 0.0
+        self.on_state = None         # tray hook: called with the new state
+        self.on_quit = None          # tray hook: called when serve() ends
+
+    def _set_state(self, state: str) -> None:
+        self.state = state
+        if self.on_state:
+            try:
+                self.on_state(state)
+            except Exception:
+                pass
 
     # ---- state machine ----
     def start(self) -> str:
@@ -609,7 +644,7 @@ class Daemon:
                 beep("error", self.cfg)
                 notify("Orpheus", f"Mic failed: {e}")
                 return f"error: {e}"
-            self.state = "recording"
+            self._set_state("recording")
             self.started_at = time.monotonic()
         beep("start", self.cfg)
         log("recording…")
@@ -622,12 +657,12 @@ class Daemon:
             try:
                 pcm = self.recorder.stop()
             except Exception as e:
-                self.state = "idle"
+                self._set_state("idle")
                 beep("error", self.cfg)
                 notify("Orpheus", f"Mic failed: {e}")
                 log(f"mic failed: {e}")
                 return f"error: {e}"
-            self.state = "busy"
+            self._set_state("busy")
         beep("stop", self.cfg)
         secs = time.monotonic() - self.started_at
         log(f"stopped after {secs:.1f}s ({len(pcm) // 2} samples)")
@@ -663,7 +698,7 @@ class Daemon:
             notify("Orpheus", text if len(text) < 200 else text[:197] + "…")
         finally:
             with self.lock:
-                self.state = "idle"
+                self._set_state("idle")
 
     # ---- control socket ----
     def handle(self, cmd: str) -> str:
@@ -703,10 +738,15 @@ class Daemon:
                     Path(control_address()).unlink()
                 except OSError:
                     pass
+            if self.on_quit:
+                try:
+                    self.on_quit()
+                except Exception:
+                    pass
 
     # ---- hotkey ----
     def hotkey_thread(self) -> threading.Thread | None:
-        spec = self.cfg["hotkey"]
+        spec = normalize_hotkey(self.cfg["hotkey"])
         if IS_WAYLAND or not HAS_DISPLAY:
             why = "Wayland session" if IS_WAYLAND else "no display"
             log(f"global hotkey disabled ({why}). Bind a system shortcut to:\n"
@@ -721,7 +761,9 @@ class Daemon:
 
         def run():
             try:
-                if self.cfg["hold_to_talk"]:
+                if IS_WIN and "<cmd>" in spec.lower():
+                    self._win_cmd_hotkey_loop(spec)
+                elif self.cfg["hold_to_talk"]:
                     combo = set(keyboard.HotKey.parse(spec))
                     hk = keyboard.HotKey(list(combo), self.start)
 
@@ -747,6 +789,37 @@ class Daemon:
         mode = "hold to talk" if self.cfg["hold_to_talk"] else "press to toggle"
         log(f"hotkey {spec} ({mode})")
         return t
+
+    def _win_cmd_hotkey_loop(self, spec: str) -> None:
+        """Win-key hotkeys need a low-level hook that swallows the letter so the
+        Windows shortcut (Win+H = voice typing) never fires."""
+        from pynput import keyboard
+        from pynput.keyboard import Key
+        kb = keyboard.Controller()
+        hold = self.cfg["hold_to_talk"]
+
+        def fire(down: bool) -> None:
+            if hold:
+                (self.start if down else self.stop)()
+            elif down:
+                self.toggle()
+
+        def inject_ctrl() -> None:
+            # AutoHotkey trick: a harmless modifier tap while Win is still held
+            # stops the Start menu from opening when Win comes back up.
+            kb.press(Key.ctrl)
+            kb.release(Key.ctrl)
+
+        hk = WinCmdHotkey(spec, fire, inject_ctrl)
+
+        def filt(msg, data):
+            if hk.event(msg, data.vkCode, bool(data.flags & LLKHF_INJECTED)):
+                listener.suppress_event()
+            return True
+
+        listener = keyboard.Listener(win32_event_filter=filt)
+        with listener:
+            listener.join()
 
     def run(self) -> None:
         log(f"orpheus desktop {VERSION} → {self.client.endpoint}")
@@ -809,12 +882,340 @@ def send_command(cmd: str, quiet: bool = False) -> str | None:
         return None
 
 
+# ------------------------------------------------------------------ win hotkey
+
+LLKHF_INJECTED = 0x10
+WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN, WM_SYSKEYUP = 0x100, 0x101, 0x104, 0x105
+_VK_GROUPS = {
+    "cmd": (0x5B, 0x5C),          # left / right Win
+    "ctrl": (0x11, 0xA2, 0xA3),
+    "alt": (0x12, 0xA4, 0xA5),
+    "shift": (0x10, 0xA0, 0xA1),
+}
+_NAMED_VKS = {
+    "space": 0x20, "enter": 0x0D, "tab": 0x09, "esc": 0x1B, "escape": 0x1B,
+    "backspace": 0x08, "insert": 0x2D, "delete": 0x2E, "home": 0x24, "end": 0x23,
+    "page_up": 0x21, "page_down": 0x22, "pause": 0x13, "caps_lock": 0x14,
+    "scroll_lock": 0x91, **{f"f{i}": 0x6F + i for i in range(1, 13)},
+}
+
+
+def normalize_hotkey(spec: str) -> str:
+    """pynput wants named keys in angle brackets: 'ctrl+alt+space' → '<ctrl>+<alt>+<space>'."""
+    parts = []
+    for part in spec.split("+"):
+        part = part.strip()
+        if len(part) > 1 and not (part.startswith("<") and part.endswith(">")):
+            part = f"<{part}>"
+        parts.append(part)
+    return "+".join(parts)
+
+
+def parse_win_hotkey(spec: str) -> tuple[list[tuple[int, ...]], int]:
+    """'<cmd>+h' → ([(0x5B, 0x5C)], 0x48): modifier vk groups + one trigger vk."""
+    groups: list[tuple[int, ...]] = []
+    trigger = None
+    for part in normalize_hotkey(spec).lower().split("+"):
+        part = part.strip()
+        if part.startswith("<") and part.endswith(">"):
+            name = {"win": "cmd", "super": "cmd", "control": "ctrl"}.get(part[1:-1], part[1:-1])
+            if name in _VK_GROUPS:
+                groups.append(_VK_GROUPS[name])
+                continue
+            if name not in _NAMED_VKS:
+                raise ValueError(f"unsupported key in hotkey: {part}")
+            trigger = _NAMED_VKS[name]
+        elif len(part) == 1 and part.isalnum() and part.isascii():
+            trigger = ord(part.upper())   # VK_A..VK_Z / VK_0..VK_9 equal ASCII
+        elif len(part) == 1:
+            import ctypes
+            trigger = ctypes.windll.user32.VkKeyScanW(ord(part)) & 0xFF
+        else:
+            raise ValueError(f"unsupported key in hotkey: {part}")
+    if trigger is None or not groups:
+        raise ValueError("hotkey needs modifiers plus one key, e.g. <cmd>+h")
+    return groups, trigger
+
+
+class WinCmdHotkey:
+    """State machine for a modifier+key hotkey on a Windows low-level hook.
+
+    event() returns True when the event must be suppressed. Pure Python so the
+    logic is testable off-Windows; the hook glue lives in the Daemon.
+    """
+
+    def __init__(self, spec: str, fire, inject_ctrl) -> None:
+        self.groups, self.trigger = parse_win_hotkey(spec)
+        self.mod_vks = {vk for g in self.groups for vk in g}
+        self.held: set[int] = set()
+        self.trigger_down = False
+        self.fire = fire                # fire(down: bool)
+        self.inject_ctrl = inject_ctrl
+
+    def _mods_active(self) -> bool:
+        return all(any(vk in self.held for vk in g) for g in self.groups)
+
+    def _dispatch(self, down: bool) -> None:
+        def go():
+            if down and (0x5B in self.held or 0x5C in self.held):
+                self.inject_ctrl()
+            self.fire(down)
+        threading.Thread(target=go, daemon=True).start()
+
+    def event(self, msg: int, vk: int, injected: bool) -> bool:
+        if injected:
+            return False                # our own Ctrl tap and the Ctrl+V paste
+        down = msg in (WM_KEYDOWN, WM_SYSKEYDOWN)
+        if vk in self.mod_vks:
+            (self.held.add if down else self.held.discard)(vk)
+            return False
+        if vk != self.trigger:
+            return False
+        if down:
+            if not self._mods_active():
+                return False
+            if not self.trigger_down:   # ignore auto-repeat
+                self.trigger_down = True
+                self._dispatch(True)
+            return True
+        if self.trigger_down:           # release after our press, even if Win went up first
+            self.trigger_down = False
+            self._dispatch(False)
+            return True
+        return False
+
+
+# ------------------------------------------------------------------ autostart / install
+
+_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+_ADVANCED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
+_OWN_KEY = r"Software\Orpheus\Desktop"
+
+
+def launch_command() -> str:
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}"'
+    exe = Path(sys.executable)
+    if IS_WIN:
+        pyw = exe.with_name("pythonw.exe")
+        if pyw.exists():
+            exe = pyw
+    return f'"{exe}" "{Path(__file__).resolve()}"'
+
+
+def autostart_desktop_path() -> Path:
+    base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    return base / "autostart" / "orpheus-desktop.desktop"
+
+
+def autostart_enabled() -> bool:
+    if IS_WIN:
+        import winreg
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+                winreg.QueryValueEx(k, "Orpheus")
+            return True
+        except OSError:
+            return False
+    return autostart_desktop_path().exists()
+
+
+def autostart_set(enabled: bool) -> None:
+    if IS_WIN:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _RUN_KEY) as k:
+            if enabled:
+                winreg.SetValueEx(k, "Orpheus", 0, winreg.REG_SZ, launch_command())
+            else:
+                try:
+                    winreg.DeleteValue(k, "Orpheus")
+                except OSError:
+                    pass
+        log(f"start with Windows: {'on' if enabled else 'off'} (HKCU\\...\\Run\\Orpheus; "
+            "toggle it in Task Manager → Startup apps too)")
+        return
+    p = autostart_desktop_path()
+    if enabled:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(
+            "[Desktop Entry]\nType=Application\nName=Orpheus Desktop\n"
+            "Comment=Push-to-talk dictation\n"
+            f"Exec={launch_command()}\nTerminal=false\nX-GNOME-Autostart-enabled=true\n",
+            encoding="utf-8")
+    else:
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
+    log(f"start at login: {'on' if enabled else 'off'} ({p})")
+
+
+def win_disabled_hotkeys(add: bool) -> None:
+    """Belt and braces for Win+H: Explorer's DisabledHotkeys list. Takes effect
+    after sign-out. Only removes the H we added ourselves."""
+    import winreg
+    with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _ADVANCED_KEY) as k:
+        try:
+            current, _ = winreg.QueryValueEx(k, "DisabledHotkeys")
+        except OSError:
+            current = ""
+        current = str(current or "")
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, _OWN_KEY) as own:
+            try:
+                we_added = winreg.QueryValueEx(own, "DisabledHotkeysAddedH")[0] == 1
+            except OSError:
+                we_added = False
+            if add:
+                if "H" in current.upper():
+                    log("Win+H already in DisabledHotkeys")
+                    return
+                winreg.SetValueEx(k, "DisabledHotkeys", 0, winreg.REG_SZ, current + "H")
+                winreg.SetValueEx(own, "DisabledHotkeysAddedH", 0, winreg.REG_DWORD, 1)
+                log("added H to Explorer DisabledHotkeys (Win+H voice typing off after sign-out)")
+            elif we_added:
+                idx = current.upper().find("H")
+                if idx >= 0:
+                    winreg.SetValueEx(k, "DisabledHotkeys", 0, winreg.REG_SZ,
+                                      current[:idx] + current[idx + 1:])
+                winreg.DeleteValue(own, "DisabledHotkeysAddedH")
+                log("removed our H from Explorer DisabledHotkeys (after sign-out)")
+
+
+def install(enabled: bool) -> None:
+    autostart_set(enabled)
+    if IS_WIN:
+        try:
+            win_disabled_hotkeys(enabled)
+        except Exception as e:
+            log(f"DisabledHotkeys registry step failed: {e}")
+
+
+def open_path(p: Path) -> None:
+    try:
+        if IS_WIN:
+            os.startfile(str(p))  # type: ignore[attr-defined]
+        elif platform.system() == "Darwin":
+            subprocess.Popen(["open", str(p)])
+        else:
+            subprocess.Popen(["xdg-open", str(p)])
+    except Exception as e:
+        log(f"could not open {p}: {e}")
+
+
+# ------------------------------------------------------------------ tray
+
+_ICON_COLORS = {"idle": (0xB3, 0x9D, 0xFF), "recording": (0xFF, 0x52, 0x52), "busy": (0xFF, 0xC4, 0x6B)}
+_ICON_LABELS = {"idle": "Idle", "recording": "Recording...", "busy": "Transcribing..."}  # ASCII: X11 WM_NAME is latin-1
+
+
+def make_icon_image(state: str = "idle", size: int = 64):
+    """The Orpheus mark: five rounded bars on a violet disc (amber arc while busy)."""
+    from PIL import Image, ImageDraw
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    d.ellipse((1, 1, size - 2, size - 2), fill=(0x20, 0x1A, 0x33, 255))
+    color = _ICON_COLORS[state] + (255,)
+    cx = cy = size / 2
+    if state == "busy":
+        inset = size * 0.28
+        d.arc((inset, inset, size - inset, size - inset), start=300, end=210,
+              fill=color, width=max(2, int(size * 0.07)))
+        return img
+    heights = (0.35, 0.62, 0.88, 0.62, 0.35) if state == "idle" else (0.55, 0.9, 0.7, 0.95, 0.5)
+    w = size * 0.085
+    gap = size * 0.16
+    x = cx - gap * 2
+    for h in heights:
+        half = size * 0.34 * h
+        d.rounded_rectangle((x - w / 2, cy - half, x + w / 2, cy + half), radius=w / 2, fill=color)
+        x += gap
+    return img
+
+
+def run_tray(daemon: "Daemon", cfg_path: Path) -> bool:
+    """Run the daemon behind a tray icon. Returns False if the tray can't run
+    (no display, pystray/Pillow missing) so the caller falls back to headless."""
+    if not HAS_DISPLAY:
+        return False
+    try:
+        import pystray
+    except Exception as e:
+        log(f"tray unavailable ({e.__class__.__name__}: {e}); running headless")
+        return False
+    try:
+        images = {s: make_icon_image(s) for s in _ICON_LABELS}
+    except Exception as e:
+        log(f"tray icon needs Pillow ({e}); running headless")
+        return False
+
+    def on_state(state: str) -> None:
+        icon.icon = images[state]
+        icon.title = f"Orpheus: {_ICON_LABELS[state]}"
+        icon.update_menu()
+
+    def toggle_autostart() -> None:
+        autostart_set(not autostart_enabled())
+
+    menu = pystray.Menu(
+        pystray.MenuItem(lambda item: _ICON_LABELS[daemon.state], None, enabled=False),
+        pystray.MenuItem("Toggle dictation", lambda: daemon.toggle(), default=True),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Start with Windows" if IS_WIN else "Start at login",
+                         toggle_autostart, checked=lambda item: autostart_enabled()),
+        pystray.MenuItem("Open config", lambda: open_path(cfg_path)),
+        pystray.MenuItem("Open failed takes folder", lambda: open_path(failed_dir())),
+        pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Quit", lambda: daemon.stop_event.set()),
+    )
+    try:
+        icon = pystray.Icon("orpheus", images["idle"], "Orpheus: Idle", menu=menu)
+    except Exception as e:
+        log(f"tray unavailable ({e.__class__.__name__}: {e}); running headless")
+        return False
+    daemon.on_state = on_state
+    daemon.on_quit = icon.stop
+    worker = threading.Thread(target=daemon.run, daemon=True)
+    worker.start()
+    try:
+        icon.run()
+    except Exception as e:
+        log(f"tray failed ({e}); continuing headless")
+        daemon.on_state = daemon.on_quit = None
+        worker.join()
+    return True
+
+
+def failed_dir() -> Path:
+    d = cache_dir() / "failed"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _attach_console() -> None:
+    """Frozen exe launched from a terminal: reuse the parent's console so
+    --version / status print something."""
+    try:
+        import ctypes
+        if ctypes.windll.kernel32.AttachConsole(-1):
+            sys.stdout = open("CONOUT$", "w", buffering=1, encoding="utf-8", errors="replace")
+            sys.stderr = sys.stdout
+    except Exception:
+        pass
+
+
 # ------------------------------------------------------------------ cli
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if IS_WIN and getattr(sys, "frozen", False) and sys.stdout is None:
+        _attach_console()
+    if "--version" in argv:
+        log(f"orpheus desktop {VERSION}")
+        return 0
     ap = argparse.ArgumentParser(description="Orpheus desktop push-to-talk dictation")
     ap.add_argument("command", nargs="?", default="daemon",
-                    choices=["daemon", "toggle", "start", "stop", "status", "quit", "transcribe"])
+                    choices=["daemon", "toggle", "start", "stop", "status", "quit", "transcribe",
+                             "install", "uninstall"])
     ap.add_argument("file", nargs="?", help="WAV file for `transcribe`")
     ap.add_argument("--setup", action="store_true", help="write the config template and exit")
     ap.add_argument("--config", help="config file path")
@@ -828,7 +1229,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--raw", action="store_true", help="skip the server's cleanup pass")
     ap.add_argument("--quiet", action="store_true", help="no beeps")
     ap.add_argument("--fake-audio", metavar="WAV", help="use this WAV instead of the mic (testing)")
-    ap.add_argument("--version", action="version", version=f"orpheus desktop {VERSION}")
+    ap.add_argument("--no-tray", action="store_true", help="headless daemon, no tray icon")
+    ap.add_argument("--version", action="store_true", help="print the version")
     a = ap.parse_args(argv)
 
     path = Path(a.config) if a.config else config_path()
@@ -837,6 +1239,10 @@ def main(argv: list[str] | None = None) -> int:
             log(f"config already exists: {path}")
         else:
             write_template(path)
+        return 0
+
+    if a.command in ("install", "uninstall"):
+        install(a.command == "install")
         return 0
 
     if a.command in ("toggle", "start", "stop", "status", "quit"):
@@ -887,7 +1293,9 @@ def main(argv: list[str] | None = None) -> int:
         print(text)
         return 0
 
-    Daemon(cfg, a.fake_audio).run()
+    daemon = Daemon(cfg, a.fake_audio)
+    if a.no_tray or not run_tray(daemon, path):
+        daemon.run()
     return 0
 
 
