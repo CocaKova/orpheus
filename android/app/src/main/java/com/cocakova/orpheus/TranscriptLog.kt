@@ -7,7 +7,17 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-data class TranscriptEntry(val ts: Long, val text: String, val words: Int)
+data class TranscriptEntry(
+    val ts: Long,
+    val text: String,
+    val words: Int,
+    /** Recognizer output before cleanup, when the server reported it. */
+    val raw: String? = null,
+    /** Package the text was dictated into ("" when unknown). */
+    val app: String = "",
+    /** Non-empty when the server's content guard fell back to the pre-passed text. */
+    val guard: String = "",
+)
 data class DayTally(val day: String, val words: Int)
 
 /**
@@ -25,7 +35,7 @@ class TranscriptLog(context: Context) {
     private val dayFmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
 
     @Synchronized
-    fun append(text: String, retentionDays: Int) {
+    fun append(text: String, retentionDays: Int, raw: String? = null, app: String = "", guard: String = "") {
         val words = text.trim().split(Regex("\\s+")).count { it.isNotBlank() }
         bumpTally(words)
         if (retentionDays == RETENTION_OFF) return
@@ -34,6 +44,9 @@ class TranscriptLog(context: Context) {
             .put("ts", System.currentTimeMillis())
             .put("text", text)
             .put("words", words)
+        if (raw != null && raw != text) obj.put("raw", raw)
+        if (app.isNotEmpty()) obj.put("app", app)
+        if (guard.isNotEmpty()) obj.put("guard", guard)
         file.appendText(obj.toString() + "\n")
     }
 
@@ -43,7 +56,12 @@ class TranscriptLog(context: Context) {
         return file.readLines().mapNotNull { line ->
             runCatching {
                 val o = JSONObject(line)
-                TranscriptEntry(o.getLong("ts"), o.getString("text"), o.optInt("words"))
+                TranscriptEntry(
+                    o.getLong("ts"), o.getString("text"), o.optInt("words"),
+                    raw = if (o.has("raw")) o.optString("raw") else null,
+                    app = o.optString("app"),
+                    guard = o.optString("guard"),
+                )
             }.getOrNull()
         }
     }

@@ -25,6 +25,37 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("raw_mode", false)
         set(v) = sp.edit().putBoolean("raw_mode", v).apply()
 
+    /**
+     * Names and terms the server should spell right, comma-separated. Sent as
+     * the OpenAI `prompt` field, so it also works as a hint for other servers.
+     */
+    var dictionary: String
+        get() = sp.getString("dictionary", "") ?: ""
+        set(v) = sp.edit().putString("dictionary", v).apply()
+
+    /** Send the text around the cursor and the target app so the server can match them. */
+    var sendContext: Boolean
+        get() = sp.getBoolean("send_context", true)
+        set(v) = sp.edit().putBoolean("send_context", v).apply()
+
+    /** Vibrate on record start/stop and on paste result. */
+    var haptics: Boolean
+        get() = sp.getBoolean("haptics", true)
+        set(v) = sp.edit().putBoolean("haptics", v).apply()
+
+    /**
+     * Insert by rewriting the field text at the cursor instead of pasting, so
+     * the clipboard is left alone. Falls back to paste when the field refuses.
+     */
+    var keepClipboard: Boolean
+        get() = sp.getBoolean("keep_clipboard", false)
+        set(v) = sp.edit().putBoolean("keep_clipboard", v).apply()
+
+    /** Snap the orb to the nearest screen edge after a drag. */
+    var snapToEdge: Boolean
+        get() = sp.getBoolean("snap_to_edge", true)
+        set(v) = sp.edit().putBoolean("snap_to_edge", v).apply()
+
     /** Days to keep transcripts; -1 = forever, 0 = don't record new ones. */
     var retentionDays: Int
         get() = sp.getInt("retention_days", 30)

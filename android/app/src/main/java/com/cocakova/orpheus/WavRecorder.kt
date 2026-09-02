@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.NoiseSuppressor
 import java.io.File
 import java.io.IOException
 import java.io.RandomAccessFile
@@ -16,6 +17,11 @@ import kotlin.math.sqrt
  * Records 16 kHz mono 16-bit PCM straight to a WAV file — exactly what ASR
  * models want, no transcode step. Streams RMS amplitude to [onAmplitude] for
  * the live waveform (called from the capture thread).
+ *
+ * Uses the VOICE_RECOGNITION source (tuned for ASR, no music-style AGC) and
+ * the platform noise suppressor when the device has one. Tracks the loudest
+ * chunk so a take that never rose above the noise floor can be skipped
+ * without a round trip.
  */
 class WavRecorder(
     private val outFile: File,
@@ -27,6 +33,15 @@ class WavRecorder(
     private var running = false
     private var record: AudioRecord? = null
     private var worker: Thread? = null
+    private var suppressor: NoiseSuppressor? = null
+
+    /** Loudest RMS chunk seen, 0..1. */
+    @Volatile
+    var peak = 0f
+        private set
+
+    /** True when nothing in the take rose above the noise floor. */
+    val silent: Boolean get() = peak < SILENCE_PEAK
 
     @SuppressLint("MissingPermission")
     fun start() {
@@ -34,7 +49,7 @@ class WavRecorder(
             sampleRate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
         val rec = AudioRecord(
-            MediaRecorder.AudioSource.MIC, sampleRate,
+            MediaRecorder.AudioSource.VOICE_RECOGNITION, sampleRate,
             AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT,
             maxOf(minBuf, 8192)
         )
@@ -43,6 +58,10 @@ class WavRecorder(
             throw IOException("Microphone unavailable")
         }
         record = rec
+        if (NoiseSuppressor.isAvailable()) {
+            suppressor = runCatching { NoiseSuppressor.create(rec.audioSessionId)?.apply { enabled = true } }
+                .getOrNull()
+        }
         running = true
         rec.startRecording()
         worker = thread(name = "orpheus-rec") {
@@ -60,7 +79,9 @@ class WavRecorder(
                         val s = buf[i].toDouble()
                         sum += s * s
                     }
-                    onAmplitude((sqrt(sum / n) / 32768.0).toFloat())
+                    val rms = (sqrt(sum / n) / 32768.0).toFloat()
+                    if (rms > peak) peak = rms
+                    onAmplitude(rms)
                     bytes.clear()
                     for (i in 0 until n) bytes.putShort(buf[i])
                     raf.write(bytes.array(), 0, n * 2)
@@ -81,6 +102,8 @@ class WavRecorder(
             it.release()
         }
         record = null
+        suppressor?.let { runCatching { it.release() } }
+        suppressor = null
         // 44-byte header + ~0.2s of 16kHz 16-bit audio
         return if (outFile.length() > 44 + 6400) outFile else {
             outFile.delete()
@@ -91,6 +114,11 @@ class WavRecorder(
     fun cancel() {
         stop()
         outFile.delete()
+    }
+
+    private companion object {
+        // speech RMS lands around 0.05–0.3; an untouched mic idles well under 0.01
+        const val SILENCE_PEAK = 0.02f
     }
 
     private fun writeHeader(raf: RandomAccessFile, dataLen: Long) {
