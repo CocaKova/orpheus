@@ -129,9 +129,10 @@ def parse_dictionary(spec: str) -> tuple[list[str], list[tuple[re.Pattern, str]]
     return words, aliases
 
 
-def prepass(text: str, aliases: list[tuple[re.Pattern, str]] = ()) -> str:
+def prepass(text: str, aliases: list[tuple[re.Pattern, str]] = (), capitalize: bool = True) -> str:
     """Rewrite unambiguous spoken symbol names into symbols and apply the
-    user's misheard-name aliases."""
+    user's misheard-name aliases. ``capitalize=False`` leaves the first
+    letter alone (mid-sentence insertion, terminal input)."""
     if not text:
         return text
     for rx, meant in aliases:
@@ -142,8 +143,12 @@ def prepass(text: str, aliases: list[tuple[re.Pattern, str]] = ()) -> str:
     for rx, rep in _TIDY:
         text = rx.sub(rep, text)
     # a sentence that now starts after a line break should be capitalised
-    text = re.sub(r"(^|\n)([a-z])", lambda m: m.group(1) + m.group(2).upper(), text)
-    return text.strip()
+    text = re.sub(r"(^|\n)([a-z])" if capitalize else r"(\n)([a-z])",
+                  lambda m: m.group(1) + m.group(2).upper(), text)
+    text = text.strip()
+    if not capitalize and text and text[0].isupper() and not _keep_case(text.split()[0], ()):
+        text = text[0].lower() + text[1:]   # recognizer's own sentence capital
+    return text
 
 
 # ----------------------------------------------------------------- prompt
@@ -159,6 +164,7 @@ RULES
 6. Numbers: prices, percents, times, dates, versions become digits ($25.50, 10%, 6pm, 09-01, v2.6.2). Small counts in prose stay words.
 7. Sequence words ("first... second..." / "one... two...") on separate thoughts become a list, one item per line.
 8. Output ONLY the formatted text. No quotes around it, no commentary, no preamble.
+9. A request may start with STYLE / CONTEXT lines before "DICTATION:". Obey them, never repeat the context, and format only the dictation.
 {dictionary}
 EXAMPLES
 in: um so send the invoice to sarah at acme dot com comma and cc me
@@ -172,7 +178,19 @@ out: "Ship it," he said - no hesitation.
 in: hashtag local peer is live at eight tonight!
 out: #localpeer is live at 8 tonight!
 in: pick up the dry cleaning, scratch that, the cleaners are closed on Mondays
-out: The cleaners are closed on Mondays."""
+out: The cleaners are closed on Mondays.
+in: STYLE: chat message — relaxed; a single short sentence gets no trailing period.
+CONTEXT: the text is inserted right after this existing text (do not repeat or continue it):
+«Running late,»
+It lands mid-sentence: start in lowercase unless the first word is a name, "I", or an acronym.
+DICTATION:
+grab me a coffee please
+out: grab me a coffee please
+in: STYLE: terminal/code — output exactly what should be typed. No sentence capitalization, no trailing period.
+DICTATION:
+Git commit dash m quote fix the nav end quote
+out: git commit -m "fix the nav"
+"""
 
 
 def build_prompt(dictionary: str) -> str:
@@ -245,3 +263,123 @@ def guard(source: str, cleaned: str) -> tuple[bool, str]:
     if len(missing) > limit:
         return False, f"{len(missing)}/{len(src)} content words dropped"
     return True, ""
+
+
+# --------------------------------------------------------------- context
+#
+# The client may tell us where the text is going: the app package, the text
+# around the cursor and/or an explicit style. Deterministic bits live here;
+# the LLM gets the same facts as STYLE / CONTEXT lines ahead of the dictation.
+
+STYLES = ("auto", "prose", "message", "email", "code")
+CONTEXT_CHARS = 240
+
+_APP_STYLES = {
+    # chat: relaxed, a lone short sentence keeps no trailing period
+    "com.whatsapp": "message", "com.whatsapp.w4b": "message",
+    "org.thoughtcrime.securesms": "message", "org.telegram.messenger": "message",
+    "com.google.android.apps.messaging": "message",
+    "com.samsung.android.messaging": "message", "com.discord": "message",
+    "com.Slack": "message", "com.facebook.orca": "message",
+    "com.instagram.android": "message", "com.snapchat.android": "message",
+    "com.microsoft.teams": "message", "im.vector.app": "message",
+    "com.beeper.android": "message", "com.cocakova.keryx": "message",
+    # email: full sentences, paragraphs kept
+    "com.google.android.gm": "email", "com.microsoft.office.outlook": "email",
+    "com.samsung.android.email.provider": "email", "me.proton.android.mail": "email",
+    "com.fsck.k9": "email", "net.thunderbird.android": "email",
+    # terminals: literal input, no sentence dressing
+    "com.cocakova.charon": "code", "com.termux": "code",
+    "com.server.auditor.ssh.client": "code", "com.sonelli.juicessh": "code",
+}
+
+_STYLE_LINES = {
+    "message": "STYLE: chat message — relaxed; a single short sentence gets no trailing period.",
+    "email": "STYLE: email — full sentences, keep paragraph breaks.",
+    "code": ("STYLE: terminal/code — output exactly what should be typed: commands, paths, "
+             "flags, identifiers. No sentence capitalization, no trailing period, digits for numbers."),
+}
+
+
+def parse_app_styles(spec: str) -> dict[str, str]:
+    """'com.foo=message, com.bar=code' -> {pkg: style}; unknown styles ignored."""
+    out = {}
+    for item in spec.split(","):
+        if "=" in item:
+            pkg, style = (x.strip() for x in item.split("=", 1))
+            if pkg and style in STYLES:
+                out[pkg] = style
+    return out
+
+
+def style_for(app: str, style: str = "", overrides: dict[str, str] | None = None) -> str:
+    """Explicit style wins; otherwise map the app package; otherwise prose."""
+    style = (style or "").strip().lower()
+    if style in STYLES and style != "auto":
+        return style
+    app = (app or "").strip()
+    return (overrides or {}).get(app) or _APP_STYLES.get(app) or "prose"
+
+
+def _ends_sentence(before: str) -> bool:
+    s = before.rstrip(" \t")
+    return not s or s.endswith("\n") or s[-1] in ".!?"
+
+
+def mid_sentence(before: str) -> bool:
+    """True when the cursor sits inside an unfinished sentence."""
+    return bool(before.strip()) and not _ends_sentence(before)
+
+
+def _keep_case(word: str, dictionary_words) -> bool:
+    """Words whose capital is meaning, not sentence position."""
+    w = word.strip("\"'([{")
+    if not w:
+        return False
+    if w == "I" or w.startswith("I'"):
+        return True
+    if any(c.isupper() for c in w[1:]):      # acronym / CamelCase / McName
+        return True
+    return any(w.lower() == d.lower() for d in dictionary_words)
+
+
+def request_hints(before: str, after: str, style: str, extra_terms: str = "") -> str:
+    """STYLE / CONTEXT lines the LLM sees ahead of the dictation ('' when none)."""
+    parts = []
+    line = _STYLE_LINES.get(style)
+    if line:
+        parts.append(line)
+    if before.strip():
+        parts.append("CONTEXT: the text is inserted right after this existing text "
+                     "(do not repeat or continue it):\n«" + before[-CONTEXT_CHARS:] + "»")
+        if mid_sentence(before):
+            parts.append("It lands mid-sentence: start in lowercase unless the first word "
+                         "is a name, \"I\", or an acronym.")
+    if after.strip():
+        parts.append("Text after the insertion point: «" + after[:80] + "»")
+    if extra_terms.strip():
+        parts.append("EXTRA TERMS the speaker uses: " + extra_terms.strip())
+    if not parts:
+        return ""
+    return "\n".join(parts) + "\nDICTATION:\n"
+
+
+def fit_context(text: str, before: str, style: str, dictionary_words=()) -> str:
+    """Deterministic finish after the LLM: casing at a mid-sentence cursor and
+    trailing-period conventions the model may have ignored."""
+    if not text:
+        return text
+    first = text.split()[0] if text.split() else ""
+    if (mid_sentence(before) or style == "code") and text[0].isupper() \
+            and not _keep_case(first, dictionary_words):
+        text = text[0].lower() + text[1:]
+    if style == "code":
+        if "\n" not in text and text.endswith(".") and not text.endswith(".."):
+            text = text[:-1]
+    elif style == "message":
+        body = text.rstrip()
+        # one short sentence, nothing else -> no trailing period
+        if body.endswith(".") and not body.endswith("..") \
+                and not re.search(r"[.!?]\s+\S", body) and "\n" not in body:
+            text = body[:-1]
+    return text

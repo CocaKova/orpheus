@@ -9,6 +9,10 @@ rejects LLM output that dropped what the speaker said and falls back to the
 pre-passed text.
 
     POST /v1/audio/transcriptions   multipart: file=<audio> [clean=true|false]
+                                    [context_before=<text left of cursor>]
+                                    [context_after=<text right of cursor>]
+                                    [app=<package/app id>] [style=auto|prose|message|email|code]
+                                    [prompt=<extra names/terms, OpenAI-style spelling hint>]
     GET  /v1/models
     GET  /healthz
 
@@ -23,6 +27,8 @@ Environment:
     ORPHEUS_DICTIONARY     comma-separated names/terms the LLM should spell
                          correctly; "heard=meant" pairs are fixed before the
                          LLM ("Jonny, Keryx, Johnny=Jonny, Currics=Keryx")
+    ORPHEUS_APP_STYLES     "pkg=style, pkg=style" additions to the built-in
+                         app -> style map (message / email / code / prose)
     ORPHEUS_API_KEY        if set, /v1/* requires "Authorization: Bearer <key>"
     ORPHEUS_MAX_UPLOAD_MB  reject uploads larger than this (default 64)
     ORPHEUS_LOG_TEXT       log transcript previews (default false: word count only)
@@ -54,7 +60,8 @@ MAX_UPLOAD_BYTES = int(os.environ.get("ORPHEUS_MAX_UPLOAD_MB", "64")) * 1024 * 1
 LOG_TEXT = os.environ.get("ORPHEUS_LOG_TEXT", "false").lower() == "true"
 
 CLEAN_PROMPT = formatting.build_prompt(DICTIONARY)
-DICT_ALIASES = formatting.parse_dictionary(DICTIONARY)[1]
+DICT_WORDS, DICT_ALIASES = formatting.parse_dictionary(DICTIONARY)
+APP_STYLES = formatting.parse_app_styles(os.environ.get("ORPHEUS_APP_STYLES", ""))
 
 log = logging.getLogger("orpheus")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -115,11 +122,13 @@ def transcribe_sync(wav_path: str) -> str:
     return hyp.text if hasattr(hyp, "text") else str(hyp)
 
 
-async def cleanup_pass(text: str) -> tuple[str, str]:
+async def cleanup_pass(text: str, hints: str = "") -> tuple[str, str]:
     """Polish pre-passed dictation via the local LLM.
 
-    Returns (text, guard_note). Falls back to the input on any error, and
-    when the model's answer fails the content guard twice.
+    ``hints`` are the STYLE / CONTEXT lines from formatting.request_hints,
+    sent ahead of the dictation. Returns (text, guard_note). Falls back to
+    the input on any error, and when the model's answer fails the content
+    guard twice.
     """
     if not text.strip():
         return text, ""
@@ -127,7 +136,7 @@ async def cleanup_pass(text: str) -> tuple[str, str]:
         "model": CLEAN_MODEL or await discover_clean_model(),
         "messages": [
             {"role": "system", "content": CLEAN_PROMPT},
-            {"role": "user", "content": text},
+            {"role": "user", "content": hints + text},
         ],
         "temperature": CLEAN_TEMP,
         "max_tokens": max(256, len(text)),
@@ -199,6 +208,11 @@ async def transcriptions(
     model: str = Form(""),          # accepted for OpenAI compatibility, ignored
     response_format: str = Form("json"),
     clean: str = Form(""),
+    context_before: str = Form(""),  # text left of the cursor in the target field
+    context_after: str = Form(""),   # text right of the cursor
+    app: str = Form(""),             # target app package / id
+    style: str = Form(""),           # auto | prose | message | email | code
+    prompt: str = Form(""),          # OpenAI-style spelling hint: extra names/terms
     authorization: str = Header(""),
 ):
     require_key(authorization)
@@ -206,6 +220,11 @@ async def transcriptions(
         raise HTTPException(503, "model still loading")
 
     do_clean = CLEAN_DEFAULT if clean == "" else clean.lower() == "true"
+    style = formatting.style_for(app, style, APP_STYLES)
+    extra_words, extra_aliases = formatting.parse_dictionary(prompt[:2000])
+    context_before = context_before[-2000:]
+    context_after = context_after[:500]
+    hints = formatting.request_hints(context_before, context_after, style, ", ".join(extra_words))
 
     data = await file.read()
     if len(data) > MAX_UPLOAD_BYTES:
@@ -220,16 +239,19 @@ async def transcriptions(
         async with gpu_lock:
             raw = await asyncio.to_thread(transcribe_sync, wav)
         t_asr = time.time() - t0
-        pre = formatting.prepass(raw, DICT_ALIASES)
+        capitalize = style != "code" and not formatting.mid_sentence(context_before)
+        pre = formatting.prepass(raw, list(DICT_ALIASES) + extra_aliases, capitalize)
         guard_note = ""
         if do_clean:
-            text, guard_note = await cleanup_pass(pre)
+            text, guard_note = await cleanup_pass(pre, hints)
         else:
             text = pre
+        text = formatting.fit_context(text, context_before, style, DICT_WORDS + extra_words)
         t_total = time.time() - t0
         # transcripts are private — log content only when explicitly asked to
         shown = repr(text[:80]) if LOG_TEXT else f"{len(text.split())} words"
-        log.info("asr %.2fs total %.2fs clean=%s%s: %s", t_asr, t_total, do_clean,
+        log.info("asr %.2fs total %.2fs clean=%s style=%s%s%s: %s", t_asr, t_total, do_clean,
+                 style, f" app={app}" if app else "",
                  f" ({guard_note})" if guard_note else "", shown)
     finally:
         os.unlink(src.name)
@@ -242,7 +264,7 @@ async def transcriptions(
     if response_format == "verbose_json":
         payload.update({"raw_text": raw, "pre_text": pre, "asr_seconds": round(t_asr, 3),
                         "total_seconds": round(t_total, 3), "cleaned": do_clean,
-                        "guard": guard_note})
+                        "guard": guard_note, "style": style})
     return JSONResponse(payload)
 
 
