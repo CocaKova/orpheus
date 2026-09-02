@@ -1,8 +1,12 @@
 """Orpheus — local dictation engine.
 
 OpenAI-compatible speech-to-text server wrapping NVIDIA Parakeet TDT,
-with an optional LLM cleanup pass (filler removal, punctuation) via any
-OpenAI-compatible chat endpoint running on the same box.
+with a deterministic spoken-symbol pre-pass ("open paren", "new line",
+"exclamation point" -> symbols) and an optional LLM cleanup pass (fillers,
+punctuation, casing, code/paths/numbers, personal dictionary) via any
+OpenAI-compatible chat endpoint running on the same box. A content guard
+rejects LLM output that dropped what the speaker said and falls back to the
+pre-passed text.
 
     POST /v1/audio/transcriptions   multipart: file=<audio> [clean=true|false]
     GET  /v1/models
@@ -15,6 +19,10 @@ Environment:
     ORPHEUS_CLEAN_URL      OpenAI-compatible base URL for cleanup
                          (default http://127.0.0.1:8000/v1)
     ORPHEUS_CLEAN_MODEL    cleanup model id (default: auto-discover via /models)
+    ORPHEUS_CLEAN_TEMP     cleanup sampling temperature (default 0.2)
+    ORPHEUS_DICTIONARY     comma-separated names/terms the LLM should spell
+                         correctly; "heard=meant" pairs are fixed before the
+                         LLM ("Jonny, Keryx, Johnny=Jonny, Currics=Keryx")
     ORPHEUS_API_KEY        if set, /v1/* requires "Authorization: Bearer <key>"
     ORPHEUS_MAX_UPLOAD_MB  reject uploads larger than this (default 64)
     ORPHEUS_LOG_TEXT       log transcript previews (default false: word count only)
@@ -29,27 +37,24 @@ import tempfile
 import time
 
 import httpx
+import formatting
 from fastapi import FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 MODEL_NAME = os.environ.get("ORPHEUS_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
 CLEAN_DEFAULT = os.environ.get("ORPHEUS_CLEAN_DEFAULT", "true").lower() == "true"
 CLEAN_URL = os.environ.get("ORPHEUS_CLEAN_URL", "http://127.0.0.1:8000/v1")
 CLEAN_MODEL = os.environ.get("ORPHEUS_CLEAN_MODEL", "")
+CLEAN_TEMP = float(os.environ.get("ORPHEUS_CLEAN_TEMP", "0.2"))
+DICTIONARY = os.environ.get("ORPHEUS_DICTIONARY", "")
 API_KEY = os.environ.get("ORPHEUS_API_KEY", "")
 MAX_UPLOAD_BYTES = int(os.environ.get("ORPHEUS_MAX_UPLOAD_MB", "64")) * 1024 * 1024
 LOG_TEXT = os.environ.get("ORPHEUS_LOG_TEXT", "false").lower() == "true"
 
-CLEAN_PROMPT = (
-    "You clean up raw speech-to-text dictation. Remove filler words (um, uh, "
-    "you know, like), false starts, and stutters. Fix punctuation and "
-    "capitalization. Keep the speaker's words and meaning exactly — do not "
-    "summarize, expand, or answer questions in the text. If the speaker "
-    "self-corrects ('meet at five, no, six'), keep only the correction. "
-    "Output only the cleaned text, nothing else."
-)
+CLEAN_PROMPT = formatting.build_prompt(DICTIONARY)
+DICT_ALIASES = formatting.parse_dictionary(DICTIONARY)[1]
 
 log = logging.getLogger("orpheus")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -110,35 +115,50 @@ def transcribe_sync(wav_path: str) -> str:
     return hyp.text if hasattr(hyp, "text") else str(hyp)
 
 
-async def cleanup_pass(text: str) -> str:
-    """Polish raw dictation via the local LLM. Falls back to raw text on any error."""
+async def cleanup_pass(text: str) -> tuple[str, str]:
+    """Polish pre-passed dictation via the local LLM.
+
+    Returns (text, guard_note). Falls back to the input on any error, and
+    when the model's answer fails the content guard twice.
+    """
     if not text.strip():
-        return text
+        return text, ""
     body = {
         "model": CLEAN_MODEL or await discover_clean_model(),
         "messages": [
             {"role": "system", "content": CLEAN_PROMPT},
             {"role": "user", "content": text},
         ],
-        "temperature": 0.6,
+        "temperature": CLEAN_TEMP,
         "max_tokens": max(256, len(text)),
         "chat_template_kwargs": {"enable_thinking": False},
     }
+    note = ""
     try:
-        r = await http_client.post(f"{CLEAN_URL}/chat/completions", json=body, timeout=30.0)
-        if r.status_code == 400:
-            # some backends (e.g. Mistral tokenizer mode) reject chat_template_kwargs
-            body.pop("chat_template_kwargs", None)
+        for attempt in (1, 2):
             r = await http_client.post(f"{CLEAN_URL}/chat/completions", json=body, timeout=30.0)
-        r.raise_for_status()
-        msg = r.json()["choices"][0]["message"]
-        # some reasoning parsers route no-think output into the
-        # reasoning field and leave content empty
-        cleaned = (msg.get("content") or msg.get("reasoning") or "").strip()
-        return cleaned or text
+            if r.status_code == 400:
+                # some backends (e.g. Mistral tokenizer mode) reject chat_template_kwargs
+                body.pop("chat_template_kwargs", None)
+                r = await http_client.post(f"{CLEAN_URL}/chat/completions", json=body, timeout=30.0)
+            r.raise_for_status()
+            msg = r.json()["choices"][0]["message"]
+            # some reasoning parsers route no-think output into the
+            # reasoning field and leave content empty
+            cleaned = (msg.get("content") or msg.get("reasoning") or "").strip()
+            if not cleaned:
+                note = "empty answer"
+                continue
+            ok, why = formatting.guard(text, cleaned)
+            if ok:
+                return cleaned, ""
+            note = why
+            log.warning("cleanup attempt %d rejected (%s)", attempt, why)
+        log.warning("cleanup rejected twice, returning pre-passed text")
+        return text, f"fallback: {note}"
     except Exception as e:
-        log.warning("cleanup pass failed, returning raw text: %s", e)
-        return text
+        log.warning("cleanup pass failed, returning pre-passed text: %s", e)
+        return text, f"fallback: {e.__class__.__name__}"
 
 
 _clean_model_cache = ""
@@ -163,6 +183,7 @@ async def healthz():
         "model": MODEL_NAME,
         "cuda": torch.cuda.is_available(),
         "clean_url": CLEAN_URL,
+        "dictionary": bool(DICTIONARY),
     }
 
 
@@ -199,11 +220,17 @@ async def transcriptions(
         async with gpu_lock:
             raw = await asyncio.to_thread(transcribe_sync, wav)
         t_asr = time.time() - t0
-        text = await cleanup_pass(raw) if do_clean else raw
+        pre = formatting.prepass(raw, DICT_ALIASES)
+        guard_note = ""
+        if do_clean:
+            text, guard_note = await cleanup_pass(pre)
+        else:
+            text = pre
         t_total = time.time() - t0
         # transcripts are private — log content only when explicitly asked to
         shown = repr(text[:80]) if LOG_TEXT else f"{len(text.split())} words"
-        log.info("asr %.2fs total %.2fs clean=%s: %s", t_asr, t_total, do_clean, shown)
+        log.info("asr %.2fs total %.2fs clean=%s%s: %s", t_asr, t_total, do_clean,
+                 f" ({guard_note})" if guard_note else "", shown)
     finally:
         os.unlink(src.name)
         if wav:
@@ -213,8 +240,9 @@ async def transcriptions(
         return PlainTextResponse(text)
     payload = {"text": text}
     if response_format == "verbose_json":
-        payload.update({"raw_text": raw, "asr_seconds": round(t_asr, 3),
-                        "total_seconds": round(t_total, 3), "cleaned": do_clean})
+        payload.update({"raw_text": raw, "pre_text": pre, "asr_seconds": round(t_asr, 3),
+                        "total_seconds": round(t_total, 3), "cleaned": do_clean,
+                        "guard": guard_note})
     return JSONResponse(payload)
 
 
