@@ -100,3 +100,5 @@ disabled so they never leave it, and the clipboard entry is flagged sensitive.
 ## License
 
 MIT
+
+Clients can also say where the text is going. `context_before` / `context_after` (the text around the cursor), `app` (the target package) and `style` (`message`, `email`, `code`, `prose`) let the server start lowercase mid-sentence, drop the trailing period on a one-line chat message, and treat terminal input as literal commands. `ORPHEUS_APP_STYLES` extends the built-in app → style map, and the OpenAI `prompt` field works as a per-request spelling hint.

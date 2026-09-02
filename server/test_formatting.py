@@ -61,3 +61,33 @@ assert words == ["Jonny", "Keryx"], words
 eq(prepass("Dash Johnny. See docs dot currics dot app.", aliases), "Dash Jonny. See docs dot Keryx dot app.")
 assert "Johnny" not in build_prompt("Johnny=Jonny") and "Jonny" in build_prompt("Johnny=Jonny")
 print("scratch-that + alias tests pass")
+
+# --- context / style
+from formatting import style_for, mid_sentence, request_hints, fit_context, parse_app_styles
+eq(style_for("com.whatsapp"), "message")
+eq(style_for("com.cocakova.charon"), "code")
+eq(style_for("com.unknown.app"), "prose")
+eq(style_for("com.whatsapp", "email"), "email")            # explicit wins
+eq(style_for("com.foo", "", parse_app_styles("com.foo=code, junk, com.bar=nope")), "code")
+assert mid_sentence("Running late,")
+assert mid_sentence("I think that")
+assert not mid_sentence("Done.")
+assert not mid_sentence("Line one\n")
+assert not mid_sentence("")
+assert not mid_sentence("   ")
+eq(request_hints("", "", "prose"), "")
+h = request_hints("Running late,", "", "message")
+assert h.startswith("STYLE: chat message") and "«Running late,»" in h and "mid-sentence" in h and h.endswith("DICTATION:\n"), h
+assert "EXTRA TERMS" in request_hints("", "", "prose", "Keryx, Spire")
+eq(fit_context("Grab me a coffee please.", "Running late,", "message"), "grab me a coffee please")
+eq(fit_context("I'll be there.", "Running late,", "message"), "I'll be there")
+eq(fit_context("Keryx is live.", "Also,", "prose", ["Keryx"]), "Keryx is live.")
+eq(fit_context("Keryx is live.", "Also,", "prose"), "keryx is live.")   # unknown name, mid-sentence
+eq(fit_context("NASA called.", "and then", "prose"), "NASA called.")
+eq(fit_context("See you at 6. Bring the docs.", "", "message"), "See you at 6. Bring the docs.")  # two sentences keep the period
+eq(fit_context("Git status.", "", "code"), "git status")
+eq(fit_context("Ls -la\ncd /tmp.", "", "code"), "ls -la\ncd /tmp.")   # multi-line: period untouched
+eq(prepass("git status.", capitalize=False), "git status.")
+eq(prepass("i think so", capitalize=False), "i think so")
+eq(prepass("I think so", capitalize=False), "I think so")
+print("context ok")
