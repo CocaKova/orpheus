@@ -2,5 +2,5 @@
 <resources>
     <string name="app_name">Orpheus</string>
     <string name="accessibility_service_label">Orpheus Dictation</string>
-    <string name="accessibility_service_description">Shows a floating Orpheus mic bubble whenever a keyboard is open and pastes your dictated text into the focused field. Audio is sent only to the speech-to-text server you configure — nothing else is read or collected.</string>
+    <string name="accessibility_service_description">Shows the floating Orpheus orb whenever you are typing and inserts your dictated text into the focused field. Audio is sent only to the speech-to-text server you configure — nothing else is read or collected.</string>
 </resources>

@@ -29,10 +29,18 @@ class RecordingForegroundService : Service() {
             .setSmallIcon(R.drawable.ic_stat_orpheus)
             .setOngoing(true)
             .build()
-        if (Build.VERSION.SDK_INT >= 30) {
-            startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
-        } else {
-            startForeground(NOTIF_ID, notif)
+        // A refused promotion must not throw out of here: that kills the process
+        // and the orb with it. The recorder keeps going; the silence check
+        // catches a muted mic ("Heard nothing") rather than a crash.
+        runCatching {
+            if (Build.VERSION.SDK_INT >= 30) {
+                startForeground(NOTIF_ID, notif, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+            } else {
+                startForeground(NOTIF_ID, notif)
+            }
+        }.onFailure {
+            ServiceHealth.log(this, ServiceHealth.MIC_FGS_FAILED, "${it.javaClass.simpleName}: ${it.message}")
+            stopSelf()
         }
         return START_NOT_STICKY
     }
