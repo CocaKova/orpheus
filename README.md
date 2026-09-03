@@ -107,6 +107,28 @@ A standalone dictation app (`android/`) in the spirit of Wispr Flow:
   transcription instead of the polished one.
 
 Install the APK from the [latest release](https://github.com/CocaKova/orpheus/releases),
+### If the orb goes missing
+
+The orb is built to stay put: one overlay window for the life of the
+service, three independent "you're typing" signals (the keyboard window,
+the IME insets, a focused text field), a grace period before it hides and a
+heartbeat that re-checks while the screen is on. What it cannot survive is
+Android stopping the accessibility service itself, so the app also:
+
+- runs a silent, collapsed **keep-alive** foreground service (Settings →
+  Staying available → Stay running; on by default) that marks Orpheus as
+  foreground work so app sleepers leave it alone;
+- asks for **unrestricted battery** — one tap in the dashboard when it is
+  not yet granted;
+- keeps a **service log** (Settings → Staying available) with every connect,
+  disconnect, crash and refusal, so a drop-out has a timestamp and a reason.
+
+Samsung phones additionally need Orpheus in *Never sleeping apps*
+(Battery → Background usage limits). The dashboard's status line turns
+amber when the service is enabled but not running; tapping it opens
+accessibility settings, where toggling the service off and on brings the
+orb back. `adb logcat -s Orpheus` shows the same signals live.
+
 or build it yourself: `cd android && ./gradlew assembleRelease` (APK lands in
 `app/build/outputs/apk/release/`). No Google services, no analytics, no
 permissions beyond mic + the accessibility service you explicitly enable.

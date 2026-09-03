@@ -51,6 +51,20 @@ class Prefs(context: Context) {
         get() = sp.getBoolean("keep_clipboard", false)
         set(v) = sp.edit().putBoolean("keep_clipboard", v).apply()
 
+    /**
+     * Keep the orb up while a text field holds input focus, even when the
+     * keyboard itself is closed. Also the safety net when the keyboard is up
+     * but Android's window list momentarily says otherwise.
+     */
+    var followCursor: Boolean
+        get() = sp.getBoolean("follow_cursor", true)
+        set(v) = sp.edit().putBoolean("follow_cursor", v).apply()
+
+    /** Run a quiet foreground service so app sleepers leave the orb service alone. */
+    var keepAlive: Boolean
+        get() = sp.getBoolean("keep_alive", true)
+        set(v) = sp.edit().putBoolean("keep_alive", v).apply()
+
     /** Snap the orb to the nearest screen edge after a drag. */
     var snapToEdge: Boolean
         get() = sp.getBoolean("snap_to_edge", true)

@@ -55,6 +55,21 @@ class BubbleView(
             postInvalidateOnAnimation()
         }
 
+    /**
+     * True while the orb is faded out. The window stays attached (so it keeps
+     * receiving insets and can never fail to re-attach); this just stops the
+     * per-frame redraw loop until it is shown again.
+     */
+    var hidden: Boolean = false
+        set(value) {
+            field = value
+            if (!value) {
+                lastFrameMs = 0L
+                lastInteractMs = SystemClock.uptimeMillis()
+                postInvalidateOnAnimation()
+            }
+        }
+
     /** A failed take is waiting: the ring turns amber until it is retried or dropped. */
     var pending: Boolean = false
         set(value) {
@@ -140,6 +155,7 @@ class BubbleView(
         (color and 0x00FFFFFF) or ((alpha.coerceIn(0f, 1f) * 255).toInt() shl 24)
 
     override fun onDraw(canvas: Canvas) {
+        if (hidden) return // faded out: no frame, no next frame
         val now = SystemClock.uptimeMillis()
         val dt = if (lastFrameMs == 0L) 16f else min((now - lastFrameMs).toFloat(), 64f)
         lastFrameMs = now
@@ -281,8 +297,10 @@ class BubbleView(
             }
         }
         canvas.restoreToCount(layer)
-        // idle breathing, color fades, and the spinner all want the next frame
-        postInvalidateOnAnimation()
+        // idle breathing, color fades, and the spinner all want the next frame —
+        // but a resting orb breathes slowly enough to draw at a fraction of the refresh rate
+        if (resting && dim - DIM_ALPHA < 0.01f) postInvalidateDelayed(REST_FRAME_MS)
+        else postInvalidateOnAnimation()
     }
 
     /** Horizontal jitter for the failure flash, dying out over the first half. */
@@ -389,5 +407,6 @@ class BubbleView(
         private const val DIM_AFTER_MS = 3500L
         private const val DIM_ALPHA = 0.72f
         private const val DIM_TAU_MS = 400f
+        private const val REST_FRAME_MS = 40L     // ~25fps is plenty for 0.3Hz breathing
     }
 }

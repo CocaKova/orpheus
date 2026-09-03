@@ -4,10 +4,15 @@ import android.Manifest
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
 import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -34,11 +39,15 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Accessibility
+import androidx.compose.material.icons.filled.Bolt
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Settings
+import androidx.compose.foundation.clickable
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -95,9 +104,69 @@ import kotlin.random.Random
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
         setContent { OrpheusTheme { OrpheusApp() } }
     }
+}
+
+private fun hasNotifications(context: Context): Boolean =
+    Build.VERSION.SDK_INT < 33 || ContextCompat.checkSelfPermission(
+        context, Manifest.permission.POST_NOTIFICATIONS
+    ) == PackageManager.PERMISSION_GRANTED
+
+private fun batteryUnrestricted(context: Context): Boolean = runCatching {
+    (context.getSystemService(Context.POWER_SERVICE) as PowerManager)
+        .isIgnoringBatteryOptimizations(context.packageName)
+}.getOrDefault(true)
+
+/** The system "let this app run in the background?" dialog, with the settings list as a fallback. */
+private fun requestBatteryExemption(context: Context) {
+    val direct = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS)
+        .setData(Uri.parse("package:${context.packageName}"))
+    runCatching { context.startActivity(direct) }.onFailure {
+        runCatching { context.startActivity(Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }
+    }
+}
+
+private fun openAppInfo(context: Context) {
+    runCatching {
+        context.startActivity(
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}"))
+        )
+    }
+}
+
+private val isSamsung get() = Build.MANUFACTURER.equals("samsung", ignoreCase = true)
+
+/** Keep-alive follows the preference immediately, whether or not the orb service is up right now. */
+private fun applyKeepAliveNow(context: Context, on: Boolean) {
+    val live = OrpheusAccessibilityService.instance
+    when {
+        live != null -> live.applyKeepAlive()
+        on -> KeepAliveService.start(context)
+        else -> KeepAliveService.stop(context)
+    }
+}
+
+/** What the last day of service lifecycle looked like, for the dashboard. */
+private data class HealthSummary(val starts: Int, val lastCrash: HealthEvent?, val lastFailure: HealthEvent?) {
+    val needsAttention get() = starts >= 3 || lastCrash != null || lastFailure != null
+}
+
+private fun healthSummary(context: Context): HealthSummary {
+    val events = ServiceHealth.recent(context, 24L * 60 * 60 * 1000)
+    return HealthSummary(
+        starts = events.count { it.event == ServiceHealth.CONNECTED },
+        lastCrash = events.lastOrNull { it.event == ServiceHealth.CRASH },
+        lastFailure = events.lastOrNull {
+            it.event == ServiceHealth.ATTACH_FAILED || it.event == ServiceHealth.KEEPALIVE_FAILED ||
+                it.event == ServiceHealth.MIC_FGS_FAILED
+        },
+    )
 }
 
 private fun hasMic(context: Context): Boolean =
@@ -166,7 +235,20 @@ fun OrpheusApp() {
     var confirmClear by remember { mutableStateOf(false) }
     var pendingDelete by remember { mutableStateOf<TranscriptEntry?>(null) }
     var disclosure by remember { mutableStateOf(false) }
+    var serviceLive by remember { mutableStateOf(OrpheusAccessibilityService.connectedSince > 0) }
+    var batteryOk by remember { mutableStateOf(batteryUnrestricted(context)) }
+    var notifOk by remember { mutableStateOf(hasNotifications(context)) }
+    var keepAlive by remember { mutableStateOf(prefs.keepAlive) }
+    var health by remember { mutableStateOf(healthSummary(context)) }
     val scope = rememberCoroutineScope()
+
+    // the service flag is a plain static in this process; a light poll keeps the status line honest
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            serviceLive = OrpheusAccessibilityService.connectedSince > 0
+            delay(1000)
+        }
+    }
 
     // Refresh permission states + history whenever we come back to the foreground
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -180,6 +262,10 @@ fun OrpheusApp() {
                 tallies = log.tallies()
                 sttUrl = prefs.sttUrl
                 pendingFile = PendingTake.file
+                batteryOk = batteryUnrestricted(context)
+                notifOk = hasNotifications(context)
+                keepAlive = prefs.keepAlive
+                health = healthSummary(context)
             }
         }
         lifecycleOwner.lifecycle.addObserver(obs)
@@ -189,6 +275,9 @@ fun OrpheusApp() {
     val micLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { micGranted = it }
+    val notifLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { notifOk = it }
 
     BackHandler(enabled = showSettings) { showSettings = false }
 
@@ -205,10 +294,21 @@ fun OrpheusApp() {
         }
         LazyColumn(
             modifier = Modifier.fillMaxSize().padding(padding),
-            contentPadding = PaddingValues(16.dp),
+            contentPadding = PaddingValues(start = 16.dp, top = 16.dp, end = 16.dp, bottom = 28.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            item { Header(onSettings = { showSettings = true }) }
+            item {
+                Header(onSettings = { showSettings = true })
+                StatusLine(
+                    accessibilityOn = accessibilityOn,
+                    serviceLive = serviceLive,
+                    keepAlive = keepAlive && KeepAliveService.running,
+                    onFix = {
+                        if (accessibilityOn) context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                        else disclosure = true
+                    },
+                )
+            }
 
             val setupDone = micGranted && accessibilityOn && sttUrl.isNotBlank()
             if (!setupDone) {
@@ -225,6 +325,23 @@ fun OrpheusApp() {
             }
 
             item { OrbPreviewCard() }
+
+            val stabilityIssue = !batteryOk || (keepAlive && !notifOk) || health.needsAttention
+            if (accessibilityOn && stabilityIssue) {
+                item {
+                    StabilityCard(
+                        batteryOk = batteryOk,
+                        notifOk = notifOk,
+                        notifWanted = keepAlive,
+                        health = health,
+                        onAllowBattery = { requestBatteryExemption(context) },
+                        onAllowNotifications = {
+                            if (Build.VERSION.SDK_INT >= 33) notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        },
+                        onAppInfo = { openAppInfo(context) },
+                    )
+                }
+            }
 
             item { StatsRow(tallies) }
 
@@ -776,6 +893,129 @@ private fun SetupRow(
     }
 }
 
+// -------- status + stability --------
+
+/**
+ * One line under the header that says whether the orb can appear right now.
+ * Enabled-but-not-running is the state that matters: Android stopped the
+ * service and it needs a toggle in accessibility settings to come back.
+ */
+@Composable
+private fun StatusLine(accessibilityOn: Boolean, serviceLive: Boolean, keepAlive: Boolean, onFix: () -> Unit) {
+    val (color, text, fixable) = when {
+        accessibilityOn && serviceLive ->
+            Triple(Mint, if (keepAlive) "Orb is live  ·  staying awake" else "Orb is live", false)
+        accessibilityOn ->
+            Triple(Amber, "Orb service is enabled but not running — tap to restart it", true)
+        else ->
+            Triple(InkMuted, "Orb service is off", false)
+    }
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 10.dp, start = 4.dp)
+            .then(if (fixable) Modifier.clickable(onClick = onFix) else Modifier),
+    ) {
+        Box(
+            Modifier
+                .size(8.dp)
+                .clip(RoundedCornerShape(4.dp))
+                .background(color),
+        )
+        Spacer(Modifier.width(8.dp))
+        Text(
+            text,
+            style = MaterialTheme.typography.labelMedium,
+            color = if (fixable) Amber else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+}
+
+/** Shown only when something can still take the orb away. Each row is one tap to fix. */
+@Composable
+private fun StabilityCard(
+    batteryOk: Boolean,
+    notifOk: Boolean,
+    notifWanted: Boolean,
+    health: HealthSummary,
+    onAllowBattery: () -> Unit,
+    onAllowNotifications: () -> Unit,
+    onAppInfo: () -> Unit,
+) {
+    Card(colors = CardDefaults.cardColors(containerColor = NightRaised)) {
+        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Text("Keep the orb around", style = MaterialTheme.typography.titleMedium)
+            if (health.needsAttention) {
+                val fmt = DateFormat.getTimeInstance(DateFormat.SHORT)
+                val line = buildString {
+                    if (health.starts >= 3) append("The orb service was restarted ${health.starts} times in the last day. ")
+                    health.lastCrash?.let { append("It crashed at ${fmt.format(Date(it.ts))} (${it.detail.take(80)}). ") }
+                    health.lastFailure?.let { append("Last problem: ${it.event} at ${fmt.format(Date(it.ts))}. ") }
+                }
+                Text(line.trim(), style = MaterialTheme.typography.bodySmall, color = Amber)
+            }
+            if (!batteryOk) {
+                SetupRow(
+                    icon = Icons.Default.Bolt,
+                    label = "Unrestricted battery",
+                    done = false,
+                    actionLabel = "Allow",
+                    onAction = onAllowBattery,
+                )
+            }
+            if (notifWanted && !notifOk) {
+                SetupRow(
+                    icon = Icons.Default.Notifications,
+                    label = "Notifications (for the keep-alive)",
+                    done = false,
+                    actionLabel = "Allow",
+                    onAction = onAllowNotifications,
+                )
+            }
+            if (isSamsung && !batteryOk) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.Default.Info, contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(10.dp))
+                    Text(
+                        "Samsung phones also put apps to sleep on their own. Add Orpheus to Never sleeping apps.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    TextButton(onClick = onAppInfo) { Text("App info") }
+                }
+            }
+        }
+    }
+}
+
+/** The last few lifecycle events, so "it dropped out at lunch" has a timestamp next to it. */
+@Composable
+private fun ServiceLog(context: Context) {
+    val events = remember { ServiceHealth.recent(context, 24L * 60 * 60 * 1000).takeLast(6).asReversed() }
+    if (events.isEmpty()) return
+    val fmt = remember { DateFormat.getTimeInstance(DateFormat.SHORT) }
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.padding(top = 4.dp)) {
+        Text("Service log, last 24 h", style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+        for (e in events) {
+            val tone = when (e.event) {
+                ServiceHealth.CRASH, ServiceHealth.ATTACH_FAILED, ServiceHealth.KEEPALIVE_FAILED,
+                ServiceHealth.MIC_FGS_FAILED -> Amber
+                ServiceHealth.CONNECTED -> Mint
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+            }
+            Text(
+                "${fmt.format(Date(e.ts))}  ${e.event}" + if (e.detail.isNotEmpty()) "  ·  ${e.detail.take(70)}" else "",
+                style = MaterialTheme.typography.labelSmall,
+                color = tone,
+            )
+        }
+    }
+}
+
 // -------- settings --------
 
 @Composable
@@ -797,7 +1037,18 @@ private fun SettingsScreen(
     var haptics by remember { mutableStateOf(prefs.haptics) }
     var keepClipboard by remember { mutableStateOf(prefs.keepClipboard) }
     var snapToEdge by remember { mutableStateOf(prefs.snapToEdge) }
+    var followCursor by remember { mutableStateOf(prefs.followCursor) }
+    var keepAlive by remember { mutableStateOf(prefs.keepAlive) }
+    var batteryOk by remember { mutableStateOf(batteryUnrestricted(context)) }
     var retention by remember { mutableStateOf(prefs.retentionDays) }
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val obs = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) batteryOk = batteryUnrestricted(context)
+        }
+        lifecycleOwner.lifecycle.addObserver(obs)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+    }
     var testing by remember { mutableStateOf(false) }
 
     LazyColumn(
@@ -898,6 +1149,46 @@ private fun SettingsScreen(
                 ToggleRow("Snap to the edge", "After a drag, the orb settles against the nearest side.", snapToEdge) {
                     snapToEdge = it; prefs.snapToEdge = it
                 }
+                ToggleRow(
+                    "Follow the cursor",
+                    "Keep the orb up while a text field is focused, even with the keyboard closed. " +
+                        "Off: the orb only shows with the keyboard.",
+                    followCursor,
+                ) { followCursor = it; prefs.followCursor = it }
+            }
+        }
+
+        item {
+            SettingsCard("Staying available",
+                "Android and some phone makers stop background services to save power. These keep the orb service out of their reach.") {
+                ToggleRow(
+                    "Stay running",
+                    "A silent, collapsed notification marks Orpheus as foreground work so it isn't put to sleep.",
+                    keepAlive,
+                ) { keepAlive = it; prefs.keepAlive = it; applyKeepAliveNow(context, it) }
+                SetupRow(
+                    icon = Icons.Default.Bolt,
+                    label = "Unrestricted battery",
+                    done = batteryOk,
+                    actionLabel = "Allow",
+                    onAction = { requestBatteryExemption(context) },
+                )
+                if (isSamsung) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.Default.Info, contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(10.dp))
+                        Text(
+                            "Samsung: in App info → Battery choose Unrestricted, and add Orpheus to " +
+                                "Never sleeping apps (Battery → Background usage limits).",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f),
+                        )
+                        TextButton(onClick = { openAppInfo(context) }) { Text("App info") }
+                    }
+                }
+                ServiceLog(context)
             }
         }
 
