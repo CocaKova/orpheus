@@ -2,6 +2,7 @@ package com.cocakova.orpheus
 
 import android.accessibilityservice.AccessibilityService
 import android.animation.ValueAnimator
+import android.app.KeyguardManager
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -53,6 +54,11 @@ import java.io.File
  *    a short grace period, so a transient glitch in one never blinks it out.
  *  - Re-checks after every event and a slow heartbeat while the screen is
  *    on, so a missed or coalesced event cannot leave the orb hidden.
+ *  - The orb belongs to whatever you are typing into, so it is gone whenever
+ *    there is no such thing: screen off, or the keyguard up. An accessibility
+ *    overlay draws above the lock screen, and the lock screen's own password
+ *    field answers "yes" to every keyboard signal we have, so this is a
+ *    check, not a side effect of the others.
  *  - Nothing in the event path is allowed to throw: an exception here kills
  *    the process and the orb with it.
  *  - A quiet keep-alive foreground service (opt-out) holds the process at
@@ -69,6 +75,7 @@ class OrpheusAccessibilityService : AccessibilityService() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var windowManager: WindowManager
+    private var keyguard: KeyguardManager? = null
     private lateinit var prefs: Prefs
     private lateinit var log: TranscriptLog
 
@@ -93,6 +100,7 @@ class OrpheusAccessibilityService : AccessibilityService() {
 
     override fun onServiceConnected() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
+        keyguard = getSystemService(KeyguardManager::class.java)
         prefs = Prefs(this)
         log = TranscriptLog(this)
         instance = this
@@ -314,6 +322,12 @@ class OrpheusAccessibilityService : AccessibilityService() {
      */
     private fun evaluate(reason: String) {
         if (bubble == null) return
+        if (!available()) {
+            // Nothing to type into, and no reason to read the keyguard's nodes.
+            cancelPendingHide()
+            if (shown) hide()
+            return
+        }
         imeWindow = imeWindowPresent()
         // Only ask the app about focus when the window list says no keyboard —
         // it is an IPC into the focused app, not worth doing when we already know.
@@ -331,7 +345,12 @@ class OrpheusAccessibilityService : AccessibilityService() {
         }
     }
 
+    /** Is there a screen, unlocked, for the orb to belong to? */
+    private fun available(): Boolean =
+        screenOn && runCatching { keyguard?.isKeyguardLocked != true }.getOrDefault(true)
+
     private fun wantVisible(): Boolean = when {
+        !available() -> false // the lock screen is not ours to decorate
         state != BubbleState.IDLE -> true // never vanish mid-take
         imeWindow -> true
         editableFocused && (imeInsets || prefs.followCursor) -> true
@@ -339,8 +358,16 @@ class OrpheusAccessibilityService : AccessibilityService() {
     }
 
     private var hidePending = false
+
+    private fun cancelPendingHide() {
+        if (!hidePending) return
+        hidePending = false
+        handler.removeCallbacks(hideRunnable)
+    }
+
     private val hideRunnable = Runnable {
         hidePending = false
+        if (!available()) { hide(); return@Runnable }
         // re-check before acting: the glitch that started this may already be over
         imeWindow = imeWindowPresent()
         editableFocused = if (imeWindow) true else editableHasFocus()
@@ -415,7 +442,14 @@ class OrpheusAccessibilityService : AccessibilityService() {
         val r = object : BroadcastReceiver() {
             override fun onReceive(context: Context?, intent: Intent?) {
                 when (intent?.action) {
-                    Intent.ACTION_SCREEN_OFF -> screenOn = false
+                    Intent.ACTION_SCREEN_OFF -> {
+                        screenOn = false
+                        // The orb is out of reach behind the lock screen, so a take
+                        // in flight would have no way to be stopped: end it here and
+                        // let the usual path transcribe and keep it.
+                        if (state == BubbleState.RECORDING) runCatching { finishRecording() }
+                        runCatching { evaluate("screen-off") }
+                    }
                     Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
                         screenOn = true
                         runCatching { evaluate("screen-on") }
