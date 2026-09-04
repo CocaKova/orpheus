@@ -14,6 +14,14 @@ import android.os.IBinder
  * Short-lived microphone foreground service, alive only while the bubble is
  * recording — keeps the mic feed unrestricted on Android 12+ while the app
  * has no visible activity.
+ *
+ * Started with [Context.startService], deliberately, not
+ * startForegroundService: that call is a five-second promise, and a promotion
+ * the platform refuses (background start, locked device, an OEM policy) makes
+ * the system kill the process with ForegroundServiceDidNotStartInTime —
+ * taking the orb and any in-flight take with it. A plain start makes the
+ * promotion best-effort: worst case the mic runs on whatever access the
+ * process already has and the silence check reports "Heard nothing".
  */
 class RecordingForegroundService : Service() {
 
@@ -51,7 +59,9 @@ class RecordingForegroundService : Service() {
 
         fun start(ctx: Context) {
             runCatching {
-                ctx.startForegroundService(Intent(ctx, RecordingForegroundService::class.java))
+                ctx.startService(Intent(ctx, RecordingForegroundService::class.java))
+            }.onFailure {
+                ServiceHealth.log(ctx, ServiceHealth.MIC_FGS_FAILED, "start: ${it.javaClass.simpleName}: ${it.message}")
             }
         }
 

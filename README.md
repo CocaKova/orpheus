@@ -123,6 +123,10 @@ Android stopping the accessibility service itself, so the app also:
 - keeps a **service log** (Settings → Staying available) with every connect,
   disconnect, crash and refusal, so a drop-out has a timestamp and a reason.
 
+The orb stays out of the way of the lock screen: it is hidden whenever the
+screen is off or the keyguard is up, and a take still recording when the
+screen goes off is finished and transcribed rather than left running.
+
 Samsung phones additionally need Orpheus in *Never sleeping apps*
 (Battery → Background usage limits). The dashboard's status line turns
 amber when the service is enabled but not running; tapping it opens
