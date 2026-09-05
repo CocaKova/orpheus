@@ -69,6 +69,7 @@ class SttClient(baseUrl: String, private val apiKey: String) {
         raw: Boolean = false,
         context: DictationContext? = null,
         dictionary: String = "",
+        keepPeriod: Boolean = false,
     ): Transcript {
         var wait = 2_000L
         var waited = 0L
@@ -80,6 +81,7 @@ class SttClient(baseUrl: String, private val apiKey: String) {
                 .apply { if (dictionary.isNotBlank()) addFormDataPart("prompt", dictionary) }
                 // Orpheus extensions; harmless to servers that ignore unknown fields
                 .apply { if (raw) addFormDataPart("clean", "false") }
+                .apply { if (keepPeriod) addFormDataPart("trailing_period", "keep") }
                 .apply {
                     if (context != null) {
                         if (context.before.isNotEmpty()) addFormDataPart("context_before", context.before)

@@ -356,6 +356,7 @@ fun OrpheusApp() {
                                         SttClient(prefs.sttUrl, prefs.sttApiKey).transcribe(
                                             file, prefs.sttModel, prefs.rawMode,
                                             PendingTake.context, prefs.dictionary,
+                                            prefs.keepPeriod,
                                         )
                                     }
                                 }
@@ -1034,6 +1035,7 @@ private fun SettingsScreen(
     var rawMode by remember { mutableStateOf(prefs.rawMode) }
     var dictionary by remember { mutableStateOf(prefs.dictionary) }
     var sendContext by remember { mutableStateOf(prefs.sendContext) }
+    var keepPeriod by remember { mutableStateOf(prefs.keepPeriod) }
     var haptics by remember { mutableStateOf(prefs.haptics) }
     var keepClipboard by remember { mutableStateOf(prefs.keepClipboard) }
     var snapToEdge by remember { mutableStateOf(prefs.snapToEdge) }
@@ -1128,6 +1130,12 @@ private fun SettingsScreen(
                     "Sends the words next to your cursor and the app name so casing and tone fit.",
                     sendContext,
                 ) { sendContext = it; prefs.sendContext = it }
+                ToggleRow(
+                    "Keep the period in chat apps",
+                    "Chat apps normally get \"on my way\" with no full stop. Turn this on to keep it. " +
+                        "Question marks and exclamations are always kept.",
+                    keepPeriod,
+                ) { keepPeriod = it; prefs.keepPeriod = it }
                 ToggleRow(
                     "Skip AI cleanup",
                     "Paste the raw transcription, unpolished (Orpheus servers only).",

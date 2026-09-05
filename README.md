@@ -59,6 +59,14 @@ a plain set, `1.` `2.` when you counted. Two things joined by "and" stay a
 sentence, and so does a list buried inside a longer one. Terminal-style
 targets (`style=code`) never get list formatting.
 
+Whatever mark you ended a sentence on comes back with it: the cleanup model
+is told terminal punctuation is content, and a deterministic pass restores
+it if the model drops one anyway. Chat apps are the one exception — a lone
+sentence loses its full stop there, the way people actually type ("on my
+way"), while questions and exclamations keep their mark. Send
+`trailing_period=keep` (Android: Settings → Keep the period in chat apps, or
+server-wide `ORPHEUS_KEEP_PERIOD=true`) if you punctuate your messages.
+
 Any audio format ffmpeg can read is accepted. `clean=false` skips the LLM
 polish and returns raw ASR output.
 
