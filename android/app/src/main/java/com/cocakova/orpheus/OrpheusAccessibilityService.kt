@@ -76,6 +76,7 @@ class OrpheusAccessibilityService : AccessibilityService() {
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var windowManager: WindowManager
     private var keyguard: KeyguardManager? = null
+    private var power: PowerManager? = null
     private lateinit var prefs: Prefs
     private lateinit var log: TranscriptLog
 
@@ -101,13 +102,13 @@ class OrpheusAccessibilityService : AccessibilityService() {
     override fun onServiceConnected() {
         windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
         keyguard = getSystemService(KeyguardManager::class.java)
+        power = getSystemService(PowerManager::class.java)
         prefs = Prefs(this)
         log = TranscriptLog(this)
         instance = this
         connectedSince = System.currentTimeMillis()
         ServiceHealth.log(this, ServiceHealth.CONNECTED, "sdk ${Build.VERSION.SDK_INT}")
-        screenOn = runCatching { (getSystemService(Context.POWER_SERVICE) as PowerManager).isInteractive }
-            .getOrDefault(true)
+        screenOn = runCatching { power?.isInteractive != false }.getOrDefault(true)
         if (bubble == null) createBubble()
         attachBubble()
         registerScreenReceiver()
@@ -324,8 +325,11 @@ class OrpheusAccessibilityService : AccessibilityService() {
         if (bubble == null) return
         if (!available()) {
             // Nothing to type into, and no reason to read the keyguard's nodes.
+            // Snap, don't fade, and do it whether or not we think the orb is
+            // showing: a fade started as the screen went off never got a frame,
+            // so `shown` can be false while the orb is still fully painted.
             cancelPendingHide()
-            if (shown) hide()
+            hide(immediate = true, reason = reason)
             return
         }
         imeWindow = imeWindowPresent()
@@ -367,11 +371,11 @@ class OrpheusAccessibilityService : AccessibilityService() {
 
     private val hideRunnable = Runnable {
         hidePending = false
-        if (!available()) { hide(); return@Runnable }
+        if (!available()) { hide(immediate = true, reason = "unavailable"); return@Runnable }
         // re-check before acting: the glitch that started this may already be over
         imeWindow = imeWindowPresent()
         editableFocused = if (imeWindow) true else editableHasFocus()
-        if (!wantVisible()) hide() else Log.i(TAG, "orb: hide cancelled on re-check")
+        if (!wantVisible()) hide(reason = "grace") else Log.i(TAG, "orb: hide cancelled on re-check")
     }
 
     private val settleRunnable = Runnable { runCatching { evaluate("settle") } }
@@ -387,10 +391,11 @@ class OrpheusAccessibilityService : AccessibilityService() {
 
     private val heartbeat = object : Runnable {
         override fun run() {
-            if (screenOn) {
-                runCatching { evaluate("heartbeat") }
-                if (prefs.keepAlive && !KeepAliveService.running) applyKeepAlive()
-            }
+            // Re-read the screen rather than trusting the last broadcast: a
+            // missed SCREEN_ON/SCREEN_OFF would otherwise strand the orb.
+            screenOn = runCatching { power?.isInteractive != false }.getOrDefault(screenOn)
+            runCatching { evaluate("heartbeat") }
+            if (screenOn && prefs.keepAlive && !KeepAliveService.running) applyKeepAlive()
             handler.postDelayed(this, HEARTBEAT_MS)
         }
     }
@@ -417,19 +422,37 @@ class OrpheusAccessibilityService : AccessibilityService() {
             .start()
     }
 
-    private fun hide() {
+    /**
+     * Fades the orb out. [immediate] snaps instead, and runs even when we
+     * already believe the orb is hidden — the only way to be sure the window
+     * is blank when there are no frames to animate with (screen off, keyguard).
+     */
+    private fun hide(immediate: Boolean = false, reason: String = "") {
         val b = bubble ?: return
-        if (!shown) return
+        if (!shown && !(immediate && !blank(b))) return
         shown = false
-        Log.i(TAG, "orb: hide ime=$imeWindow insets=$imeInsets editable=$editableFocused")
+        Log.i(TAG, "orb: hide ($reason)${if (immediate) " now" else ""} ime=$imeWindow insets=$imeInsets editable=$editableFocused")
         setTouchable(false)
         b.animate().cancel()
+        if (immediate) {
+            // No animation: a ViewPropertyAnimator waits on the choreographer,
+            // and with the display off no frame ever comes — the orb would stay
+            // painted straight through onto the lock screen.
+            b.alpha = 0f
+            b.scaleX = 0.6f
+            b.scaleY = 0.6f
+            b.hidden = true
+            return
+        }
         b.animate().alpha(0f).scaleX(0.6f).scaleY(0.6f)
             .setDuration(160L)
             .setInterpolator(AccelerateInterpolator())
             .withEndAction { if (!shown) b.hidden = true } // stop drawing once faded
             .start()
     }
+
+    /** Fully faded out and not drawing: nothing left to hide. */
+    private fun blank(b: BubbleView): Boolean = b.hidden && b.alpha == 0f
 
     private fun setState(s: BubbleState) {
         state = s
@@ -636,6 +659,13 @@ class OrpheusAccessibilityService : AccessibilityService() {
      * is the fallback, copying only at that point.
      */
     private fun insertIntoFocusedField(text: String): Boolean {
+        if (runCatching { keyguard?.isKeyguardLocked == true }.getOrDefault(false)) {
+            // A take finished by the screen going off lands while the keyguard
+            // is up, and the keyguard's own password box is a focusable
+            // editable. Never type into it: the clipboard fallback takes over.
+            Log.i(TAG, "paste: keyguard is up, not inserting")
+            return false
+        }
         val node = findFocusedEditable()
         if (node == null) {
             Log.i(TAG, "paste: no focused editable (active=${rootInActiveWindow?.packageName}, windows=${windows.size})")
