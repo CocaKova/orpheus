@@ -1,7 +1,8 @@
 """Dictation formatting: spoken-symbol pre-pass, cleanup prompt, and the
 content-preservation guard that keeps the LLM honest.
 
-Pipeline:  ASR text -> prepass() -> LLM cleanup -> guard() -> final text
+Pipeline:  ASR text -> prepass() -> LLM cleanup -> guard() -> restore_terminal()
+           -> listify() -> fit_context() -> final text
 
 The pre-pass is deterministic and only rewrites tokens that are unambiguous
 when spoken ("new line", "open paren", "exclamation point"). Words that are
@@ -257,7 +258,7 @@ _PROMPT = """You are a dictation formatter. Turn raw speech-to-text into clean w
 RULES
 1. Preserve every content word the speaker said. Never drop, summarize, expand, or answer. If unsure, keep it.
 2. Remove fillers (um, uh, you know, like, "so" at sentence start), stutters and false starts. Apply self-corrections: "five, no, six" -> "six". After "scratch that" / "actually" / "I mean", KEEP the words that follow and delete the phrase before it.
-3. Use normal sentence case. Undo Title Case the recognizer invented. Fix punctuation. Keep line breaks that are already in the text.
+3. Use normal sentence case. Undo Title Case the recognizer invented. Fix punctuation. Keep line breaks that are already in the text. Keep the mark each sentence ends on: a question keeps its "?", an exclamation keeps its "!". Never end a question with a period.
 4. Spoken symbol names that are still words become symbols: "dot"->".", "at"->"@" only inside an email address, "hashtag word"->#word (joined), "dash"->"-", "hyphen"->"-", "colon"->":", "comma"->",", "equals"->"=", "plus"->"+", "star"->"*", "hash"->"#".
 5. Spoken code, paths, commands and addresses become literal: "get user (user id)"->get_user(user_id); "jonny at example dot com"->jonny@example.com; "npm --version" stays; "/home/jon" stays.
 6. Numbers: prices, percents, times, dates, versions become digits ($25.50, 10%, 6pm, 09-01, v2.6.2). Small counts in prose stay words.
@@ -387,6 +388,57 @@ def guard(source: str, cleaned: str) -> tuple[bool, str]:
     return True, ""
 
 
+# ------------------------------------------------------- terminal punctuation
+
+_TERMINALS = ".!?…"
+_CLOSERS = "\"'’”)]}»"
+# punctuation a sentence can legitimately trail off on: a lead-in colon, a
+# clause the caller will continue. Nothing to restore after these.
+_OPEN_PUNCT = ":;,-–—*_`/"
+
+
+def _mark_at(text: str) -> tuple[int, str]:
+    """Index and value of the last character that isn't a closing quote or
+    bracket ('he said "ship it"?' -> the '?'). (-1, "") for empty text."""
+    body = text.rstrip()
+    i = len(body) - 1
+    while i >= 0 and body[i] in _CLOSERS:
+        i -= 1
+    return (i, body[i]) if i >= 0 else (-1, "")
+
+
+def restore_terminal(source: str, cleaned: str) -> str:
+    """Put back the mark the speaker ended on when the cleanup model dropped or
+    downgraded it.
+
+    The model is told to keep terminal punctuation, and mostly does — but under
+    the relaxed message style it will now and then strip a question mark along
+    with the trailing period it was allowed to drop, which reads as a different
+    sentence. The speaker's own mark wins: it is restored when the model ended
+    on nothing, and a "?" or "!" is restored over a period the model settled
+    for. A period is never forced over the model's "?" or "!" — hearing the
+    question is exactly the judgement the model is there to make.
+    """
+    if not source.strip() or not cleaned.strip():
+        return cleaned
+    _, src_mark = _mark_at(source)
+    if src_mark not in _TERMINALS:
+        return cleaned
+    body = cleaned.rstrip()
+    if _ITEM_LINE.match(body.rsplit("\n", 1)[-1]):
+        return cleaned                      # list items carry no terminal mark
+    i, out_mark = _mark_at(body)
+    if out_mark == src_mark:
+        return cleaned
+    if out_mark in _TERMINALS:
+        if src_mark not in "?!":
+            return cleaned                  # the model's mark is the better one
+        return body[:i] + src_mark + body[i + 1:]
+    if out_mark in _OPEN_PUNCT:
+        return cleaned                      # deliberately unfinished
+    return body + src_mark
+
+
 # --------------------------------------------------------------- context
 #
 # The client may tell us where the text is going: the app package, the text
@@ -416,7 +468,8 @@ _APP_STYLES = {
 }
 
 _STYLE_LINES = {
-    "message": "STYLE: chat message — relaxed; a single short sentence gets no trailing period.",
+    "message": ("STYLE: chat message — relaxed; a single short statement gets no trailing period. "
+                "A question still ends with \"?\" and an exclamation with \"!\"."),
     "email": "STYLE: email — full sentences, keep paragraph breaks.",
     "code": ("STYLE: terminal/code — output exactly what should be typed: commands, paths, "
              "flags, identifiers. No sentence capitalization, no trailing period, digits for numbers."),
