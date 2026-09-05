@@ -125,7 +125,12 @@ Android stopping the accessibility service itself, so the app also:
 
 The orb stays out of the way of the lock screen: it is hidden whenever the
 screen is off or the keyguard is up, and a take still recording when the
-screen goes off is finished and transcribed rather than left running.
+screen goes off is finished and transcribed rather than left running. That
+hide is a snap, not a fade — with the display off there are no frames for an
+animation to run on, so a fade would leave the orb painted on the lock screen
+— and it is re-asserted on every heartbeat, which reads the screen itself
+rather than trusting the last broadcast it saw. Text is never inserted while
+the keyguard is up; it goes to the clipboard instead.
 
 Samsung phones additionally need Orpheus in *Never sleeping apps*
 (Battery → Background usage limits). The dashboard's status line turns
