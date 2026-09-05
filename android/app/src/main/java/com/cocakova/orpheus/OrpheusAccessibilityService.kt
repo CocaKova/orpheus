@@ -580,7 +580,8 @@ class OrpheusAccessibilityService : AccessibilityService() {
             val result = withContext(Dispatchers.IO) {
                 runCatching {
                     SttClient(prefs.sttUrl, prefs.sttApiKey)
-                        .transcribe(file, prefs.sttModel, prefs.rawMode, ctx, prefs.dictionary)
+                        .transcribe(file, prefs.sttModel, prefs.rawMode, ctx, prefs.dictionary,
+                                    prefs.keepPeriod)
                 }
             }
             setState(BubbleState.IDLE)

@@ -33,6 +33,15 @@ class Prefs(context: Context) {
         get() = sp.getString("dictionary", "") ?: ""
         set(v) = sp.edit().putString("dictionary", v).apply()
 
+    /**
+     * Keep the trailing period on a lone sentence in chat apps. Off by default:
+     * the chat convention is to leave it off ("on my way"), which is what the
+     * server does unless this is set.
+     */
+    var keepPeriod: Boolean
+        get() = sp.getBoolean("keep_period", false)
+        set(v) = sp.edit().putBoolean("keep_period", v).apply()
+
     /** Send the text around the cursor and the target app so the server can match them. */
     var sendContext: Boolean
         get() = sp.getBoolean("send_context", true)

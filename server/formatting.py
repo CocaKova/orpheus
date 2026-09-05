@@ -539,9 +539,13 @@ def request_hints(before: str, after: str, style: str, extra_terms: str = "") ->
     return "\n".join(parts) + "\nDICTATION:\n"
 
 
-def fit_context(text: str, before: str, style: str, dictionary_words=()) -> str:
+def fit_context(text: str, before: str, style: str, dictionary_words=(),
+                keep_period: bool = False) -> str:
     """Deterministic finish after the LLM: casing at a mid-sentence cursor and
-    trailing-period conventions the model may have ignored."""
+    trailing-period conventions the model may have ignored.
+
+    ``keep_period=True`` turns off the chat convention that drops the period
+    from a lone sentence, for people who punctuate their messages."""
     if not text:
         return text
     first = text.split()[0] if text.split() else ""
@@ -551,7 +555,7 @@ def fit_context(text: str, before: str, style: str, dictionary_words=()) -> str:
     if style == "code":
         if "\n" not in text and text.endswith(".") and not text.endswith(".."):
             text = text[:-1]
-    elif style == "message":
+    elif style == "message" and not keep_period:
         body = text.rstrip()
         # one short sentence, nothing else -> no trailing period
         if body.endswith(".") and not body.endswith("..") \

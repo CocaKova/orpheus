@@ -160,3 +160,10 @@ eq(fit_context(restore_terminal("Are you around?", "Are you around"), "", "messa
 eq(fit_context(restore_terminal("I'm on my way.", "I'm on my way."), "", "message"),
    "I'm on my way")
 print("terminal punctuation tests pass")
+
+# --- the chat-app period convention is a preference
+eq(fit_context("I'm on my way.", "", "message"), "I'm on my way")
+eq(fit_context("I'm on my way.", "", "message", keep_period=True), "I'm on my way.")
+eq(fit_context("Are you around?", "", "message", keep_period=True), "Are you around?")
+eq(fit_context("git status.", "", "code", keep_period=True), "git status")   # code is unaffected
+print("trailing period preference tests pass")

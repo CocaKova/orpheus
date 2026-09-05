@@ -15,6 +15,7 @@ pre-passed text.
                                     [context_before=<text left of cursor>]
                                     [context_after=<text right of cursor>]
                                     [app=<package/app id>] [style=auto|prose|message|email|code]
+                                    [trailing_period=keep|drop]
                                     [prompt=<extra names/terms, OpenAI-style spelling hint>]
     GET  /v1/models
     GET  /healthz
@@ -32,6 +33,9 @@ Environment:
                          LLM ("Jonny, Keryx, Johnny=Jonny, Currics=Keryx")
     ORPHEUS_APP_STYLES     "pkg=style, pkg=style" additions to the built-in
                          app -> style map (message / email / code / prose)
+    ORPHEUS_KEEP_PERIOD    keep the trailing period on a lone sentence in chat
+                         apps (default false: the chat convention drops it);
+                         per request via the trailing_period field
     ORPHEUS_API_KEY        if set, /v1/* requires "Authorization: Bearer <key>"
     ORPHEUS_MAX_UPLOAD_MB  reject uploads larger than this (default 64)
     ORPHEUS_LOG_TEXT       log transcript previews (default false: word count only)
@@ -65,6 +69,7 @@ LOG_TEXT = os.environ.get("ORPHEUS_LOG_TEXT", "false").lower() == "true"
 CLEAN_PROMPT = formatting.build_prompt(DICTIONARY)
 DICT_WORDS, DICT_ALIASES = formatting.parse_dictionary(DICTIONARY)
 APP_STYLES = formatting.parse_app_styles(os.environ.get("ORPHEUS_APP_STYLES", ""))
+KEEP_PERIOD = os.environ.get("ORPHEUS_KEEP_PERIOD", "false").lower() == "true"
 
 log = logging.getLogger("orpheus")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(message)s")
@@ -216,6 +221,7 @@ async def transcriptions(
     app: str = Form(""),             # target app package / id
     style: str = Form(""),           # auto | prose | message | email | code
     prompt: str = Form(""),          # OpenAI-style spelling hint: extra names/terms
+    trailing_period: str = Form(""),  # keep | drop — the chat-style period convention
     authorization: str = Header(""),
 ):
     require_key(authorization)
@@ -223,6 +229,8 @@ async def transcriptions(
         raise HTTPException(503, "model still loading")
 
     do_clean = CLEAN_DEFAULT if clean == "" else clean.lower() == "true"
+    keep_period = KEEP_PERIOD if trailing_period == "" \
+        else trailing_period.strip().lower() in ("keep", "true")
     style = formatting.style_for(app, style, APP_STYLES)
     extra_words, extra_aliases = formatting.parse_dictionary(prompt[:2000])
     context_before = context_before[-2000:]
@@ -252,7 +260,8 @@ async def transcriptions(
             text = pre
         if style != "code" and not formatting.mid_sentence(context_before):
             text = formatting.listify(text)
-        text = formatting.fit_context(text, context_before, style, DICT_WORDS + extra_words)
+        text = formatting.fit_context(text, context_before, style,
+                                      DICT_WORDS + extra_words, keep_period)
         t_total = time.time() - t0
         # transcripts are private — log content only when explicitly asked to
         shown = repr(text[:80]) if LOG_TEXT else f"{len(text.split())} words"
