@@ -135,3 +135,28 @@ eq(prepass("1. Back up 2. Migrate 3. Restart."), "1. Back up\n2. Migrate\n3. Res
 eq(prepass("We moved to Python 3. Restart the gateway after."), "We moved to Python 3. Restart the gateway after.")
 eq(prepass("Chapter 2. Then chapter 4. Done."), "Chapter 2. Then chapter 4. Done.")   # not a 1-2-3 run
 print("inline numbering tests pass")
+
+from formatting import restore_terminal
+
+# --- the mark the speaker ended on survives the cleanup model
+eq(restore_terminal("What time does the meeting start?", "What time does the meeting start"),
+   "What time does the meeting start?")
+eq(restore_terminal("That's amazing!", "That's amazing"), "That's amazing!")
+eq(restore_terminal("Did the restart finish?", "Did the restart finish."),
+   "Did the restart finish?")                                   # ? beats the model's period
+eq(restore_terminal('He said "ship it"?', 'He said "ship it"'), 'He said "ship it"?')
+eq(restore_terminal("Ship it.", "Ship it?"), "Ship it?")         # the model heard a question: its call
+eq(restore_terminal("Ship it.", "Ship it."), "Ship it.")
+eq(restore_terminal("Ship it", "Ship it"), "Ship it")            # nothing to restore
+eq(restore_terminal("From the store I need eggs, milk and bread.",
+                    "From the store I need:\n- Eggs\n- Milk\n- Bread"),
+   "From the store I need:\n- Eggs\n- Milk\n- Bread")            # list items end bare
+eq(restore_terminal("Here is what I need.", "Here is what I need:"),
+   "Here is what I need:")                                       # a lead-in stays open
+eq(restore_terminal("Hey?", ""), "")
+# and the message style still drops a plain trailing period, but never a question
+eq(fit_context(restore_terminal("Are you around?", "Are you around"), "", "message"),
+   "Are you around?")
+eq(fit_context(restore_terminal("I'm on my way.", "I'm on my way."), "", "message"),
+   "I'm on my way")
+print("terminal punctuation tests pass")

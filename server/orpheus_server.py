@@ -50,7 +50,7 @@ import formatting
 from fastapi import FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-VERSION = "1.1.1"
+VERSION = "1.1.2"
 
 MODEL_NAME = os.environ.get("ORPHEUS_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
 CLEAN_DEFAULT = os.environ.get("ORPHEUS_CLEAN_DEFAULT", "true").lower() == "true"
@@ -247,6 +247,7 @@ async def transcriptions(
         guard_note = ""
         if do_clean:
             text, guard_note = await cleanup_pass(pre, hints)
+            text = formatting.restore_terminal(pre, text)
         else:
             text = pre
         if style != "code" and not formatting.mid_sentence(context_before):
