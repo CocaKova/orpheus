@@ -140,18 +140,18 @@ async def cleanup_pass(text: str, hints: str = "") -> tuple[str, str]:
     """
     if not text.strip():
         return text, ""
-    body = {
-        "model": CLEAN_MODEL or await discover_clean_model(),
-        "messages": [
-            {"role": "system", "content": CLEAN_PROMPT},
-            {"role": "user", "content": hints + text},
-        ],
-        "temperature": CLEAN_TEMP,
-        "max_tokens": max(256, len(text)),
-        "chat_template_kwargs": {"enable_thinking": False},
-    }
     note = ""
     try:
+        body = {
+            "model": CLEAN_MODEL or await discover_clean_model(),
+            "messages": [
+                {"role": "system", "content": CLEAN_PROMPT},
+                {"role": "user", "content": hints + text},
+            ],
+            "temperature": CLEAN_TEMP,
+            "max_tokens": max(256, len(text)),
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
         for attempt in (1, 2):
             r = await http_client.post(f"{CLEAN_URL}/chat/completions", json=body, timeout=30.0)
             if r.status_code == 400:
