@@ -367,9 +367,12 @@ def _respelled(word: str, have: set[str]) -> bool:
 def guard(source: str, cleaned: str) -> tuple[bool, str]:
     """Return (ok, reason). ok=False means the LLM lost real content.
 
-    Two failure shapes are caught: bulk loss (many content words missing)
-    and truncation (the dictation's last content word is gone — the most
-    common way a chat model "cleans" a trailing sentence out of existence).
+    Three failure shapes are caught: bulk loss (many content words missing),
+    truncation (the dictation's last content word is gone — the most common
+    way a chat model "cleans" a trailing sentence out of existence), and a
+    clipped opening (the first content word is gone — "Hey Sy, remind me"
+    coming back as "Remind me"; under the bulk limit, so it went unnoticed
+    until the Call made it audible on 09-05).
     """
     src = _content_words(source)
     if not src:
@@ -380,11 +383,13 @@ def guard(source: str, cleaned: str) -> tuple[bool, str]:
     joined = cleaned.lower()
     missing = [w for w in src if w not in have and w not in joined
                and not _respelled(w, have)]
-    if src[-1] in missing:
-        return False, f"trailing word dropped: {src[-1]!r}"
     limit = max(3, int(len(src) * 0.15))
     if len(missing) > limit:
         return False, f"{len(missing)}/{len(src)} content words dropped"
+    if src[-1] in missing:
+        return False, f"trailing word dropped: {src[-1]!r}"
+    if src[0] in missing:
+        return False, f"leading word dropped: {src[0]!r}"
     return True, ""
 
 

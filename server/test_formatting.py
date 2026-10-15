@@ -31,6 +31,10 @@ ok, why = guard("the quick brown fox jumps over the lazy dog near the river bank
 assert not ok and "content words" in why, why
 ok, _ = guard("hashtag local peer is live tonight", "#localpeer is live tonight")
 assert ok  # joined tokens count as kept
+ok, why = guard("Karina is out at Mexico today, remember?", "Out at Mexico today, remember?")
+assert not ok and "leading" in why, why  # a clipped opening is a loss too
+ok, _ = guard("Um, Karina is out at Mexico today.", "Karina is out at Mexico today.")
+assert ok  # a dropped filler in front is not
 
 # --- prompt
 assert "DICTIONARY" not in build_prompt("")
