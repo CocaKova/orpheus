@@ -111,7 +111,8 @@ Releases can trail `main`. If you want the newest fixes, build from source (see 
 | Field | Meaning |
 |---|---|
 | `file` | The audio. Any format ffmpeg reads. |
-| `response_format` | `json` (default, `{"text": …}`), `text`, or `verbose_json` (adds `raw_text`, `pre_text`, timings, `cleaned`, `guard`, `style`) |
+| `response_format` | `json` (default, `{"text": …}`), `text`, or `verbose_json` (adds `raw_text`, `pre_text`, timings, `cleaned`, `guard`, `style`, `duration`) |
+| `timestamp_granularities[]` | `word`, with `verbose_json`: adds `words`, OpenAI-style `[{word, start, end}]` in seconds, from the raw ASR (before formatting and cleanup). Only computed when asked for, so plain dictation never pays for it. |
 | `clean` | `true` / `false`. Default comes from `ORPHEUS_CLEAN_DEFAULT`. |
 | `context_before`, `context_after` | Text left and right of the cursor in the target field (the server keeps the last 2000 / first 500 characters) |
 | `app` | Target app package or id. Picks a style from the built-in map (common chat, email and terminal apps) plus `ORPHEUS_APP_STYLES`. |

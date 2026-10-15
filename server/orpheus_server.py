@@ -12,6 +12,9 @@ rejects LLM output that dropped what the speaker said and falls back to the
 pre-passed text.
 
     POST /v1/audio/transcriptions   multipart: file=<audio> [clean=true|false]
+                                    [response_format=json|text|verbose_json]
+                                    [timestamp_granularities[]=word]  (verbose_json only: adds
+                                     "words" [{word, start, end}] from the raw ASR, and "duration")
                                     [context_before=<text left of cursor>]
                                     [context_after=<text right of cursor>]
                                     [app=<package/app id>] [style=auto|prose|message|email|code]
@@ -48,13 +51,15 @@ import os
 import subprocess
 import tempfile
 import time
+import wave
 
 import httpx
 import formatting
+import timestamps
 from fastapi import FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-VERSION = "1.1.2"
+VERSION = "1.2.0"
 
 MODEL_NAME = os.environ.get("ORPHEUS_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
 CLEAN_DEFAULT = os.environ.get("ORPHEUS_CLEAN_DEFAULT", "true").lower() == "true"
@@ -124,10 +129,18 @@ def to_wav16k(src_path: str) -> str:
     return dst.name
 
 
-def transcribe_sync(wav_path: str) -> str:
-    out = asr_model.transcribe([wav_path], verbose=False)
-    hyp = out[0]
-    return hyp.text if hasattr(hyp, "text") else str(hyp)
+def transcribe_sync(wav_path: str, words: bool = False) -> tuple[str, list[dict] | None]:
+    """Raw ASR text, plus word timings only when asked (the dictation path never asks)."""
+    if not words:
+        hyp = asr_model.transcribe([wav_path], verbose=False)[0]
+        return (hyp.text if hasattr(hyp, "text") else str(hyp)), None
+    hyp = asr_model.transcribe([wav_path], verbose=False, timestamps=True)[0]
+    return hyp.text, timestamps.word_timings(getattr(hyp, "timestamp", None))
+
+
+def wav_seconds(wav_path: str) -> float:
+    with wave.open(wav_path) as w:
+        return w.getnframes() / float(w.getframerate())
 
 
 async def cleanup_pass(text: str, hints: str = "") -> tuple[str, str]:
@@ -222,6 +235,7 @@ async def transcriptions(
     style: str = Form(""),           # auto | prose | message | email | code
     prompt: str = Form(""),          # OpenAI-style spelling hint: extra names/terms
     trailing_period: str = Form(""),  # keep | drop — the chat-style period convention
+    timestamp_granularities: list[str] = Form([], alias="timestamp_granularities[]"),
     authorization: str = Header(""),
 ):
     require_key(authorization)
@@ -243,12 +257,17 @@ async def transcriptions(
     src = tempfile.NamedTemporaryFile(suffix=os.path.splitext(file.filename or "")[1] or ".bin", delete=False)
     src.write(data)
     src.close()
+    want_words = response_format == "verbose_json" and "word" in timestamp_granularities
     wav = None
+    words = None
+    duration = None
     t0 = time.time()
     try:
         wav = await asyncio.to_thread(to_wav16k, src.name)
+        if response_format == "verbose_json":
+            duration = wav_seconds(wav)
         async with gpu_lock:
-            raw = await asyncio.to_thread(transcribe_sync, wav)
+            raw, words = await asyncio.to_thread(transcribe_sync, wav, want_words)
         t_asr = time.time() - t0
         capitalize = style != "code" and not formatting.mid_sentence(context_before)
         pre = formatting.prepass(raw, list(DICT_ALIASES) + extra_aliases, capitalize)
@@ -279,7 +298,9 @@ async def transcriptions(
     if response_format == "verbose_json":
         payload.update({"raw_text": raw, "pre_text": pre, "asr_seconds": round(t_asr, 3),
                         "total_seconds": round(t_total, 3), "cleaned": do_clean,
-                        "guard": guard_note, "style": style})
+                        "guard": guard_note, "style": style, "duration": round(duration, 3)})
+        if want_words:
+            payload["words"] = words
     return JSONResponse(payload)
 
 
