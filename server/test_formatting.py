@@ -64,6 +64,11 @@ words, aliases = parse_dictionary("Jonny, Keryx, Johnny=Jonny, Currics=Keryx, ,"
 assert words == ["Jonny", "Keryx"], words
 eq(prepass("Dash Johnny. See docs dot currics dot app.", aliases), "Dash Jonny. See docs dot Keryx dot app.")
 assert "Johnny" not in build_prompt("Johnny=Jonny") and "Jonny" in build_prompt("Johnny=Jonny")
+# a list typed one entry per line (the phone's dictionary field takes line breaks)
+words, aliases = parse_dictionary("Carix=Keryx\nTellaria=Talaria\r\nCharon;  Sharon=Charon\n\n")
+assert words == ["Keryx", "Talaria", "Charon"], words
+eq(prepass("I am working on Carix today, and Sharon and Tellaria are next.", aliases),
+   "I am working on Keryx today, and Charon and Talaria are next.")
 print("scratch-that + alias tests pass")
 
 # --- context / style

@@ -31,7 +31,7 @@ Environment:
                          (default http://127.0.0.1:8000/v1)
     ORPHEUS_CLEAN_MODEL    cleanup model id (default: auto-discover via /models)
     ORPHEUS_CLEAN_TEMP     cleanup sampling temperature (default 0.2)
-    ORPHEUS_DICTIONARY     comma-separated names/terms the LLM should spell
+    ORPHEUS_DICTIONARY     names/terms the LLM should spell, split at commas, semicolons or line breaks
                          correctly; "heard=meant" pairs are fixed before the
                          LLM ("Jonny, Keryx, Johnny=Jonny, Currics=Keryx")
     ORPHEUS_APP_STYLES     "pkg=style, pkg=style" additions to the built-in
@@ -59,7 +59,7 @@ import timestamps
 from fastapi import FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 
 MODEL_NAME = os.environ.get("ORPHEUS_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
 CLEAN_DEFAULT = os.environ.get("ORPHEUS_CLEAN_DEFAULT", "true").lower() == "true"

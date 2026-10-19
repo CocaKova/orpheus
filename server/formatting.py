@@ -209,9 +209,12 @@ _TIDY = [
 def parse_dictionary(spec: str) -> tuple[list[str], list[tuple[re.Pattern, str]]]:
     """'Jonny, Keryx, Johnny=Jonny, Currics=Keryx' ->
     (["Jonny", "Keryx"], [(/\bjohnny\b/i, "Jonny"), (/\bcurrics\b/i, "Keryx")])
-    Plain words go to the prompt; `heard=meant` pairs are fixed before the LLM."""
+    Plain words go to the prompt; `heard=meant` pairs are fixed before the LLM.
+    Entries end at a comma, a semicolon or a line break: a list typed one entry
+    per line used to read as ONE entry, so the first misheard word came back as
+    its fix plus the rest of the list."""
     words, aliases = [], []
-    for item in spec.split(","):
+    for item in re.split(r"[,;\r\n]", spec):
         item = item.strip()
         if not item:
             continue

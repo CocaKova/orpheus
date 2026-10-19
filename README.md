@@ -138,7 +138,7 @@ The server reads environment variables only. All of these are optional.
 | `ORPHEUS_CLEAN_URL` | `http://127.0.0.1:8000/v1` | OpenAI-compatible base URL for the cleanup model |
 | `ORPHEUS_CLEAN_MODEL` | first model listed by `/models` | Cleanup model id |
 | `ORPHEUS_CLEAN_TEMP` | `0.2` | Cleanup sampling temperature |
-| `ORPHEUS_DICTIONARY` | empty | Comma-separated names and terms to spell right, e.g. `"Ada, Keryx, DGX Spark"`. `heard=meant` pairs (`Currics=Keryx`) are fixed before the LLM sees the text. |
+| `ORPHEUS_DICTIONARY` | empty | Names and terms to spell right, split at commas, semicolons or line breaks, e.g. `"Ada, Keryx, DGX Spark"`. `heard=meant` pairs (`Currics=Keryx`) are fixed before the LLM sees the text. |
 | `ORPHEUS_APP_STYLES` | empty | `pkg=style, pkg=style` additions to the built-in app → style map |
 | `ORPHEUS_KEEP_PERIOD` | `false` | Keep the full stop on a lone sentence in chat apps |
 | `ORPHEUS_API_KEY` | empty | If set, `/v1/*` requires `Authorization: Bearer <key>` |
