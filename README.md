@@ -70,8 +70,10 @@ dictation still works, only less polished.
   open Orpheus and work through the Setup card: microphone access, the accessibility service
   (the orb), and your server URL. The test-connection button tells you the URL works before you
   dictate.
-- **Windows:** download `OrpheusDesktop.exe` from the same release, set `url` in its config and
-  press Win+H. Details in [`desktop/README.md`](desktop/README.md).
+- **Windows:** download `OrpheusSetup-<version>.exe` from the same release and run it (no
+  administrator rights needed). Orpheus opens its Settings window: enter your server URL, press
+  Test connection, then Save, and press Win+H to dictate. A portable zip is attached too. Details
+  in [`desktop/README.md`](desktop/README.md).
 - **Linux desktop:** run `desktop/orpheus_desktop.py` from source (Python 3.11+). Same README.
 - **Anything else** that takes an OpenAI-compatible STT URL: point it at `http://your-host:8123`.
 
@@ -217,8 +219,10 @@ accessibility settings, where turning the service off and on brings the orb back
 - **Android.** Needs Android 8.0 (API 26) or newer. Accessibility overlays behave differently across
   vendors; the Samsung note above is the one I know about.
 - **Desktop.** Windows and Linux (X11 and Wayland). No macOS client.
-- **Unsigned binaries.** The Windows exe is unsigned, so SmartScreen warns the first time. The
-  release APK is signed with a debug key.
+- **Code signing.** Windows builds are signed through SignPath (see the
+  [code signing policy](#code-signing-policy)) starting with the first release after the project is
+  approved. Earlier Windows builds are unsigned, so SmartScreen warns the first time. The release
+  APK is signed with a debug key.
 
 This is a personal project, provided as is under the MIT license. Not affiliated with or endorsed by
 NVIDIA, OpenAI or Wispr. Parakeet TDT is NVIDIA's model and is downloaded from Hugging Face under its
@@ -237,9 +241,44 @@ cd server && python test_formatting.py
 builds them, so your build won't install over the release APK (or the other way round) without
 uninstalling first.
 
-**Windows exe:** the [`desktop-windows`](.github/workflows/desktop-windows.yml) workflow builds
-`OrpheusDesktop.exe` with PyInstaller from `desktop/OrpheusDesktop.spec`, smoke-tests it, and
-attaches it to the release on every `v*` tag.
+**Desktop tests:** `cd desktop && python test_desktop.py` (no display, mic or server needed).
+
+**Windows installer:** the [`desktop-windows`](.github/workflows/desktop-windows.yml) workflow
+builds the app folder with PyInstaller from `desktop/OrpheusDesktop.spec`, using a PyInstaller
+bootloader compiled from source on the build machine (the prebuilt one is shared with too many
+unrelated programs, which is what antivirus heuristics key on). It signs the app through SignPath
+when the repository has the SignPath settings, packs it with Inno Setup
+(`desktop/installer/orpheus.iss`) into `OrpheusSetup-<version>.exe`, signs that too, smoke-tests,
+installs and uninstalls it, and attaches the installer and a portable zip to the release on every
+`v*` tag.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org).
+
+What is signed: the Windows desktop client (`OrpheusDesktop.exe`) and its installer
+(`OrpheusSetup-<version>.exe`), built by the [`desktop-windows`](.github/workflows/desktop-windows.yml)
+workflow on GitHub-hosted runners straight from this repository's source. Every release signing
+request is approved by hand. Signing starts with the first release after SignPath Foundation
+approves the project; earlier Windows builds are unsigned.
+
+Team roles:
+
+- Committers and reviewers: [CocaKova](https://github.com/CocaKova)
+- Approvers: [CocaKova](https://github.com/CocaKova)
+
+### Privacy
+
+This program will not transfer any information to other networked systems unless specifically
+requested by the user or the person installing or operating it.
+
+In practice: the desktop client sends your recordings, with your dictionary and style settings, to
+the transcription server URL you enter in its settings, and nowhere else (until you enter one, that
+is `localhost`). It has no telemetry, no accounts and no update check. The Android app does the
+same with the server you set in it. If you run the server, it sends the recognized text to the
+cleanup LLM endpoint you configure (`ORPHEUS_CLEAN_URL`) and nothing of yours anywhere else; its only
+other connection is the first-start download of the Parakeet model from Hugging Face.
 
 ## License
 

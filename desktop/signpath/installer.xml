@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration "installer" (paste into the SignPath project).
+  The input is dist\OrpheusSetup-<version>.exe, zipped by actions/upload-artifact.
+  It is built from the already signed app folder, so this request signs only
+  the setup exe itself.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" />
+  </parameters>
+  <zip-file>
+    <pe-file path="OrpheusSetup-*.exe" product-name="Orpheus" product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

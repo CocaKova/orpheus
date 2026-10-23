@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration "app" (paste into the SignPath project).
+  The input is the PyInstaller folder dist\OrpheusDesktop, zipped by
+  actions/upload-artifact. Only our own exe is signed: the Python runtime in
+  _internal\ is upstream (python.org signs its own DLLs) and passes through.
+  The workflow passes the parameter version = VERSION in orpheus_desktop.py.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <parameters>
+    <parameter name="version" />
+  </parameters>
+  <zip-file>
+    <pe-file path="OrpheusDesktop.exe" product-name="Orpheus" product-version="${version}">
+      <authenticode-sign />
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

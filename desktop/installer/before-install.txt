@@ -1,0 +1,29 @@
+Orpheus is push-to-talk dictation: press a hotkey, talk, and the text is
+typed into the window you are working in. Here is everything it does on
+this PC.
+
+WHAT IT CHANGES
+
+- It installs for you only, in %LOCALAPPDATA%\Programs\Orpheus. No
+  administrator rights, nothing for other users.
+- It adds "Orpheus" and "Orpheus settings" to the Start menu.
+- If you keep "Start Orpheus when I sign in to Windows" ticked on the next
+  page, it adds itself to your startup apps. You can turn that off in
+  Orpheus settings or in Task Manager > Startup apps.
+- While it runs it watches key presses only to spot its hotkey (Win+H by
+  default, which takes that key over from Windows voice typing) and keeps
+  none of them. It pastes the text with Ctrl+V and reads the clipboard
+  only to put back what was on it.
+
+WHAT IT SENDS
+
+- Your recordings go to the transcription server you set in Orpheus
+  settings, and nowhere else. Until you set one, that is this PC
+  (localhost). Orpheus has no telemetry, no accounts and no update check.
+
+UNINSTALLING
+
+Settings > Apps > Orpheus > Uninstall removes the program and its startup
+entry. Your settings (%APPDATA%\Orpheus) and any recordings saved after a
+failed transcription (%LOCALAPPDATA%\Orpheus\failed) stay until you delete
+them.

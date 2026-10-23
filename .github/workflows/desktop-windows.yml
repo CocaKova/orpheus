@@ -6,21 +6,33 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to upload OrpheusDesktop.exe to (leave empty to only build)'
+        description: 'Release tag to upload the installer to (leave empty to only build)'
         required: false
         default: ''
 
 permissions:
-  contents: write
+  contents: write   # upload to the release
+  actions: read     # SignPath reads this run's job and artifacts
 
 jobs:
   build:
-    name: Build OrpheusDesktop.exe
-    runs-on: windows-latest
+    name: Build the Windows installer
+    # windows-2025 has Visual Studio 2022 (MSVC) for the bootloader build;
+    # windows-latest has moved on to VS 2026.
+    runs-on: windows-2025
     defaults:
       run:
         working-directory: desktop
         shell: pwsh
+    env:
+      # Code signing switches on once the SignPath organization id is set as a
+      # repository variable (Settings > Secrets and variables > Actions >
+      # Variables). Until then the build stays green and ships unsigned.
+      SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+      # A release (tag push, or a tag given by hand) is signed with the release
+      # policy, which waits for a person to approve it in SignPath. Every other
+      # build uses the test policy.
+      RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != '' }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
@@ -30,36 +42,204 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt pyinstaller
+      - name: Read the version
+        id: ver
+        run: |
+          $v = (Select-String -Path orpheus_desktop.py -Pattern '^VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "desktop version $v"
+          $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } elseif ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { '' }
+          if ($tag -and $tag -ne "v$v") { "::warning::release $tag carries desktop $v (VERSION in orpheus_desktop.py)" }
+        env:
+          INPUT_TAG: ${{ github.event.inputs.tag }}
 
-      - name: Build with PyInstaller
-        run: pyinstaller OrpheusDesktop.spec
+      - name: Install dependencies
+        run: |
+          python -m pip install --no-cache-dir -r requirements.txt
+          if ($LASTEXITCODE -ne 0) { throw "pip install failed" }
+
+      - name: Install PyInstaller, its bootloader compiled here from source
+        # PyInstaller's prebuilt bootloader is inside countless unrelated exes,
+        # some of them malware, so antivirus engines learn its bytes. With
+        # PYINSTALLER_COMPILE_BOOTLOADER set, installing from the sdist compiles
+        # it with MSVC on this runner, and the install fails rather than fall
+        # back to a prebuilt one.
+        env:
+          PYINSTALLER_COMPILE_BOOTLOADER: '1'
+        run: |
+          python -m pip install --no-cache-dir --verbose --no-binary=pyinstaller "pyinstaller==6.22.3" *> pyinstaller-install.log
+          $code = $LASTEXITCODE
+          Get-Content pyinstaller-install.log -Tail 30
+          if ($code -ne 0) { throw "pip install pyinstaller failed" }
+          if (-not (Select-String -Path pyinstaller-install.log -Pattern 'compile forced' -Quiet)) {
+            throw "no sign of the bootloader being compiled here"
+          }
+
+      - name: Compare with the prebuilt bootloader
+        # For the record: the bytes differ from the wheel's (a warning if not).
+        continue-on-error: true
+        run: |
+          python -m pip download --no-deps --only-binary=:all: --platform win_amd64 "pyinstaller==6.22.3" -d "$env:RUNNER_TEMP\pyi-wheel" | Out-Null
+          $check = @'
+          import glob, hashlib, os, sys, zipfile, PyInstaller
+          d = os.path.join(os.path.dirname(PyInstaller.__file__), "bootloader", "Windows-64bit-intel")
+          z = zipfile.ZipFile(glob.glob(os.path.join(sys.argv[1], "pyinstaller-*.whl"))[0])
+          for name in ("run.exe", "runw.exe"):
+              ours = hashlib.sha256(open(os.path.join(d, name), "rb").read()).hexdigest()
+              wheel = hashlib.sha256(z.read("PyInstaller/bootloader/Windows-64bit-intel/" + name)).hexdigest()
+              print(f"{name}: here {ours[:16]}  prebuilt {wheel[:16]}")
+              if ours == wheel:
+                  print(f"::warning::{name} is byte-identical to the prebuilt bootloader")
+          '@
+          $check | python - "$env:RUNNER_TEMP\pyi-wheel"
+
+      - name: Unit tests
+        run: |
+          python test_desktop.py
+          if ($LASTEXITCODE -ne 0) { throw "test_desktop.py failed" }
+
+      - name: Build the app folder
+        run: |
+          pyinstaller --noconfirm OrpheusDesktop.spec
+          if ($LASTEXITCODE -ne 0) { throw "pyinstaller failed" }
 
       - name: Smoke test
         run: |
-          $exe = Resolve-Path dist\OrpheusDesktop.exe
+          $exe = Resolve-Path dist\OrpheusDesktop\OrpheusDesktop.exe
           $log = Join-Path $env:LOCALAPPDATA 'Orpheus\orpheus-desktop.log'
-          $ver = (Select-String -Path orpheus_desktop.py -Pattern '^VERSION = "([^"]+)"').Matches[0].Groups[1].Value
+          $ver = "${{ steps.ver.outputs.version }}"
           # windowed exe: no stdout, so read the log file it writes instead
           $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru
           if ($p.ExitCode -ne 0) { throw "--version exited $($p.ExitCode)" }
           $p = Start-Process -FilePath $exe -ArgumentList 'status' -Wait -PassThru
           if ($p.ExitCode -ne 1) { throw "status exited $($p.ExitCode), expected 1 (no daemon)" }
+          $p = Start-Process -FilePath $exe -ArgumentList 'settings', '--smoke' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "settings --smoke exited $($p.ExitCode)" }
           Get-Content $log
           if (-not (Select-String -Path $log -Pattern "orpheus desktop $ver" -Quiet)) { throw "version line missing from $log" }
           if (-not (Select-String -Path $log -Pattern 'daemon not running' -Quiet)) { throw "status line missing from $log" }
-          "exe size: $((Get-Item $exe).Length / 1MB) MB"
+          if (-not (Select-String -Path $log -Pattern 'settings window ok' -Quiet)) { throw "the Settings window did not build (tkinter missing?)" }
+          $v = (Get-Item $exe).VersionInfo
+          "ProductName=$($v.ProductName) ProductVersion=$($v.ProductVersion)"
+          if ($v.ProductName -ne 'Orpheus' -or $v.ProductVersion -ne $ver) { throw "exe version resource wrong" }
+          "folder size: {0:N1} MB" -f ((Get-ChildItem dist\OrpheusDesktop -Recurse | Measure-Object Length -Sum).Sum / 1MB)
+
+      - name: Upload the app for signing
+        if: env.SIGN == 'true'
+        id: upload-app
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrpheusDesktop-unsigned
+          path: desktop/dist/OrpheusDesktop
+          if-no-files-found: error
+
+      - name: Sign the app (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'orpheus' }}
+          signing-policy-slug: ${{ env.RELEASE == 'true' && (vars.SIGNPATH_RELEASE_POLICY || 'release-signing') || (vars.SIGNPATH_TEST_POLICY || 'test-signing') }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_APP_CONFIG || 'app' }}
+          github-artifact-id: ${{ steps.upload-app.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600   # a release waits for an approver
+          output-artifact-directory: desktop/dist/OrpheusDesktop-signed
+          parameters: |
+            version: "${{ steps.ver.outputs.version }}"
+
+      - name: Use the signed app
+        if: env.SIGN == 'true'
+        run: |
+          Remove-Item -Recurse -Force dist\OrpheusDesktop
+          Move-Item dist\OrpheusDesktop-signed dist\OrpheusDesktop
+          $p = Start-Process -FilePath (Resolve-Path dist\OrpheusDesktop\OrpheusDesktop.exe) -ArgumentList '--version' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "signed exe --version exited $($p.ExitCode)" }
+
+      - name: Build the installer
+        run: |
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+            $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          }
+          & $iscc /Qp "/DAppVersion=${{ steps.ver.outputs.version }}" installer\orpheus.iss
+          if ($LASTEXITCODE -ne 0) { throw "iscc failed" }
+          Get-Item dist\OrpheusSetup-*.exe | Format-Table Name, Length
+
+      - name: Upload the installer for signing
+        if: env.SIGN == 'true'
+        id: upload-setup
+        uses: actions/upload-artifact@v4
+        with:
+          name: OrpheusSetup-unsigned
+          path: desktop/dist/OrpheusSetup-*.exe
+          if-no-files-found: error
+
+      - name: Sign the installer (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'orpheus' }}
+          signing-policy-slug: ${{ env.RELEASE == 'true' && (vars.SIGNPATH_RELEASE_POLICY || 'release-signing') || (vars.SIGNPATH_TEST_POLICY || 'test-signing') }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_SETUP_CONFIG || 'installer' }}
+          github-artifact-id: ${{ steps.upload-setup.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: desktop/dist/setup-signed
+          parameters: |
+            version: "${{ steps.ver.outputs.version }}"
+
+      - name: Use the signed installer
+        if: env.SIGN == 'true'
+        run: Move-Item -Force dist\setup-signed\OrpheusSetup-*.exe dist\
+
+      - name: Check the signatures
+        if: env.SIGN == 'true' && env.RELEASE == 'true'
+        run: |
+          $files = @((Resolve-Path dist\OrpheusDesktop\OrpheusDesktop.exe).Path) + (Get-ChildItem dist\OrpheusSetup-*.exe).FullName
+          foreach ($f in $files) {
+            $s = Get-AuthenticodeSignature $f
+            "$f : $($s.Status) $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid') { throw "$f is not validly signed" }
+          }
+
+      - name: Install, run, uninstall
+        run: |
+          $setup = (Get-ChildItem dist\OrpheusSetup-*.exe).FullName
+          $dir = Join-Path $env:RUNNER_TEMP 'orpheus-install-test'
+          $p = Start-Process -FilePath $setup -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/MERGETASKS="!startup"', "/DIR=`"$dir`"", "/LOG=`"$env:RUNNER_TEMP\setup.log`"" -Wait -PassThru
+          if ($p.ExitCode -ne 0) { Get-Content "$env:RUNNER_TEMP\setup.log" -Tail 40; throw "setup exited $($p.ExitCode)" }
+          $exe = Join-Path $dir 'OrpheusDesktop.exe'
+          if (-not (Test-Path $exe)) { throw "not installed: $exe" }
+          $p = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installed exe --version exited $($p.ExitCode)" }
+          $p = Start-Process -FilePath (Join-Path $dir 'unins000.exe') -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "uninstall exited $($p.ExitCode)" }
+          # unins000.exe hands over to a copy of itself in %TEMP% and returns at once
+          for ($i = 0; $i -lt 60 -and (Test-Path $exe); $i++) { Start-Sleep -Milliseconds 500 }
+          if (Test-Path $exe) { throw "uninstall left $exe behind" }
+          "install / uninstall OK"
+
+      - name: Portable zip
+        run: |
+          Compress-Archive -Path dist\OrpheusDesktop -DestinationPath "dist\OrpheusDesktop-${{ steps.ver.outputs.version }}-portable.zip" -Force
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: OrpheusDesktop
-          path: desktop/dist/OrpheusDesktop.exe
+          name: Orpheus-windows
+          path: |
+            desktop/dist/OrpheusSetup-*.exe
+            desktop/dist/OrpheusDesktop-*-portable.zip
           if-no-files-found: error
 
       - name: Upload to release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.tag != ''
+        if: env.RELEASE == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           INPUT_TAG: ${{ github.event.inputs.tag }}
@@ -69,6 +249,7 @@ jobs:
           $tag = if ($env:INPUT_TAG) { $env:INPUT_TAG } else { $env:REF_NAME }
           gh release view $tag --repo $env:REPO *> $null
           if ($LASTEXITCODE -ne 0) {
-            gh release create $tag --repo $env:REPO --title "Orpheus $($tag.TrimStart('v'))" --notes "Windows desktop client build." --verify-tag
+            $notes = "Windows desktop client: run the installer (OrpheusSetup), or unzip the portable folder.`n`nCode signing policy: https://github.com/CocaKova/orpheus#code-signing-policy"
+            gh release create $tag --repo $env:REPO --title "Orpheus $($tag.TrimStart('v'))" --notes $notes --verify-tag
           }
-          gh release upload $tag dist/OrpheusDesktop.exe --repo $env:REPO --clobber
+          gh release upload $tag (Get-ChildItem dist\OrpheusSetup-*.exe).FullName (Get-ChildItem dist\OrpheusDesktop-*-portable.zip).FullName --repo $env:REPO --clobber
