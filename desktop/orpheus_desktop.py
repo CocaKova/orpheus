@@ -3,8 +3,9 @@
 Orpheus desktop — push-to-talk dictation for Windows and Linux.
 
     python orpheus_desktop.py                 # daemon: hotkey + control socket
+    python orpheus_desktop.py settings        # the Settings window
     python orpheus_desktop.py toggle          # start/stop from a shortcut (Wayland)
-    python orpheus_desktop.py start | stop | status | quit
+    python orpheus_desktop.py start | stop | status | reload | quit
     python orpheus_desktop.py transcribe clip.wav
     python orpheus_desktop.py install         # start at login (Task Manager → Startup apps)
     python orpheus_desktop.py uninstall
@@ -17,6 +18,7 @@ which is saved so it is never lost.
 
 Required:  requests, numpy, sounddevice, pynput   (see requirements.txt)
 Optional:  pystray + Pillow (tray icon; headless daemon without them),
+           tkinter (the Settings window; without it, edit the config file),
            arecord (Linux mic fallback when portaudio is missing),
            wl-copy/wl-paste or xclip/xsel, wtype or ydotool (Wayland paste),
            notify-send, paplay/aplay.
@@ -25,8 +27,10 @@ from __future__ import annotations
 
 import argparse
 import io
+import json
 import os
 import platform
+import re
 import shutil
 import socket
 import struct
@@ -39,7 +43,7 @@ import wave
 from datetime import datetime
 from pathlib import Path
 
-VERSION = "1.1.0"
+VERSION = "1.3.0"
 RATE = 16000
 IS_WIN = platform.system() == "Windows"
 IS_LINUX = platform.system() == "Linux"
@@ -60,51 +64,59 @@ DEFAULTS = {
     "raw": False,
     "dictionary": "",
     "style": "",
+    "keep_period": False,
     "sounds": True,
     "control_port": 47123,   # Windows only; Linux uses a unix socket
 }
 
-CONFIG_TEMPLATE = """# Orpheus desktop client — edit and restart the daemon.
+# The Settings window writes this file from the template below, so the
+# comments survive a save. @key@ is replaced by the TOML value of cfg[key].
+CONFIG_TEMPLATE = """# Orpheus desktop client. The Settings window (tray icon → Settings) writes
+# this file. Edited by hand? Run `orpheus_desktop.py reload` or restart it.
 
 # Orpheus (or any OpenAI-compatible) transcription server.
 # Bare host, /v1, or the full /v1/audio/transcriptions path all work.
-url = "http://localhost:8123"
+url = @url@
 
 # Only if the server has ORPHEUS_API_KEY set.
-api_key = ""
+api_key = @api_key@
 
 # Optional model name (ignored by Orpheus, required by some other servers).
-model = ""
+model = @model@
 
 # Global hotkey (pynput syntax). Windows and X11 only; on Wayland bind
 # `orpheus_desktop.py toggle` as a system shortcut instead.
 # Windows default <cmd>+h = Win+H, which replaces Windows voice typing.
-hotkey = "@HOTKEY@"
+hotkey = @hotkey@
 
 # false = press once to start, again to stop.  true = record while held.
-hold_to_talk = false
+hold_to_talk = @hold_to_talk@
 
 # Paste the text into the focused window (Ctrl+V). false = clipboard only.
-paste = true
+paste = @paste@
 
 # Put whatever was on the clipboard back after pasting.
-restore_clipboard = true
+restore_clipboard = @restore_clipboard@
 
 # Skip the server's AI cleanup pass (verbatim ASR output).
-raw = false
+raw = @raw@
 
-# Names and terms to spell right, comma-separated (sent as the OpenAI
+# Names and terms to spell right, separated by commas (sent as the OpenAI
 # `prompt` hint; Orpheus servers also take heard=meant pairs).
-dictionary = ""
+dictionary = @dictionary@
 
 # Orpheus servers: "" (prose) | message | email | code — how to dress the text.
-style = ""
+style = @style@
+
+# Orpheus servers, message style: keep the period at the end of a
+# one-sentence message (by default it is dropped, the way people type in chat).
+keep_period = @keep_period@
 
 # Beep on record start/stop.
-sounds = true
+sounds = @sounds@
 
 # Windows only: local TCP port for the toggle/start/stop commands.
-control_port = 47123
+control_port = @control_port@
 """
 
 
@@ -153,28 +165,84 @@ def cache_dir() -> Path:
     return d
 
 
-def write_template(path: Path) -> None:
+def toml_value(v) -> str:
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    # A JSON string is a valid TOML basic string, except that TOML wants
+    # DEL escaped too.
+    return json.dumps(str(v), ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def render_config(cfg: dict) -> str:
+    text = CONFIG_TEMPLATE
+    for k in DEFAULTS:
+        text = text.replace(f"@{k}@", toml_value(cfg.get(k, DEFAULTS[k])))
+    return text
+
+
+def save_config(path: Path, cfg: dict) -> None:
+    """Write the whole file from the template, atomically."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(CONFIG_TEMPLATE.replace("@HOTKEY@", DEFAULT_HOTKEY), encoding="utf-8")
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(render_config(cfg), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def write_template(path: Path) -> None:
+    save_config(path, DEFAULTS)
     log(f"wrote config template: {path}")
 
 
+def _coerce(default, v):
+    """Keep a hand-edited value the type the code expects ("true" → True)."""
+    if isinstance(default, bool):
+        return v if isinstance(v, bool) else str(v).strip().lower() in ("1", "true", "yes", "on")
+    if isinstance(default, int):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return default
+    return "" if v is None else str(v)
+
+
 def load_config(path: Path) -> dict:
+    """Defaults overlaid with the file. A missing file is not created here:
+    the daemon opens the Settings window for it (or writes the template when
+    there is no window to show)."""
     cfg = dict(DEFAULTS)
     if not path.exists():
-        write_template(path)
         return cfg
     try:
         import tomllib
     except ImportError:  # Python < 3.11
         log("python 3.11+ needed for tomllib; using defaults")
         return cfg
-    with open(path, "rb") as f:
-        data = tomllib.load(f)
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        log(f"config {path} unreadable ({e}); using defaults")
+        return cfg
     for k in DEFAULTS:
         if k in data:
-            cfg[k] = data[k]
+            cfg[k] = _coerce(DEFAULTS[k], data[k])
     return cfg
+
+
+def dictionary_entries(text: str) -> list[str]:
+    """Split a dictionary the way Orpheus servers do: commas, semicolons, line breaks."""
+    return [e.strip() for e in re.split(r"[,;\n]", text or "") if e.strip()]
+
+
+def server_base(url: str) -> str:
+    """'http://h:8123/v1/audio/transcriptions' or '.../v1' → 'http://h:8123'."""
+    b = url.strip().rstrip("/")
+    for suffix in ("/audio/transcriptions", "/v1"):
+        if b.endswith(suffix):
+            b = b[: -len(suffix)]
+    return b
 
 
 # ------------------------------------------------------------------ audio
@@ -331,7 +399,7 @@ class SttClient:
     RETRY_STEPS = (2, 3, 5, 8, 10, 12)
 
     def __init__(self, url: str, api_key: str = "", model: str = "", raw: bool = False,
-                 dictionary: str = "", style: str = "") -> None:
+                 dictionary: str = "", style: str = "", keep_period: bool = False) -> None:
         import requests
         self._requests = requests
         self.endpoint = endpoint_url(url)
@@ -340,8 +408,14 @@ class SttClient:
         self.raw = raw
         self.dictionary = dictionary
         self.style = style
+        self.keep_period = keep_period
 
-    def transcribe(self, wav: bytes, rate: int = RATE) -> str:
+    @classmethod
+    def from_config(cls, cfg: dict) -> "SttClient":
+        return cls(cfg["url"], cfg["api_key"], cfg["model"], cfg["raw"],
+                   cfg["dictionary"], cfg["style"], cfg["keep_period"])
+
+    def form_fields(self) -> dict:
         data = {"response_format": "json"}
         if self.model:
             data["model"] = self.model
@@ -351,6 +425,13 @@ class SttClient:
             data["prompt"] = self.dictionary
         if self.style:
             data["style"] = self.style
+        if self.keep_period:
+            # only when on, like the Android app: other servers see nothing new
+            data["trailing_period"] = "keep"
+        return data
+
+    def transcribe(self, wav: bytes, rate: int = RATE) -> str:
+        data = self.form_fields()
         t0 = time.monotonic()
         deadline = t0 + self.RETRY_BUDGET_S
         last = "no response"
@@ -583,23 +664,19 @@ def beep(kind: str, cfg: dict) -> None:
     threading.Thread(target=play, daemon=True).start()
 
 
+# Windows: the tray icon shows notifications (Shell_NotifyIcon; Windows 10/11
+# render them as toasts). Set by run_tray; headless on Windows = log only.
+# This replaced a hidden PowerShell toast script, which is the kind of thing
+# antivirus heuristics flag.
+_TRAY_NOTIFY = None
+
+
 def notify(title: str, body: str) -> None:
     def send():
         try:
             if IS_WIN:
-                ps = (
-                    "[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;"
-                    "$x = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);"
-                    "$t = $x.GetElementsByTagName('text');"
-                    "$t.Item(0).AppendChild($x.CreateTextNode($env:ORPHEUS_T)) | Out-Null;"
-                    "$t.Item(1).AppendChild($x.CreateTextNode($env:ORPHEUS_B)) | Out-Null;"
-                    "[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier("
-                    "'{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\\WindowsPowerShell\\v1.0\\powershell.exe').Show("
-                    "[Windows.UI.Notifications.ToastNotification]::new($x))"
-                )
-                env = dict(os.environ, ORPHEUS_T=title, ORPHEUS_B=body)
-                subprocess.run(["powershell", "-NoProfile", "-WindowStyle", "Hidden", "-Command", ps],
-                               env=env, capture_output=True, timeout=8)
+                if _TRAY_NOTIFY is not None:
+                    _TRAY_NOTIFY(title, body)
             elif shutil.which("notify-send"):
                 _run(["notify-send", "-a", "Orpheus", "-t", "4000", title, body], timeout=3)
         except Exception:
@@ -611,12 +688,14 @@ def notify(title: str, body: str) -> None:
 # ------------------------------------------------------------------ daemon
 
 class Daemon:
-    def __init__(self, cfg: dict, fake_audio: str | None = None) -> None:
+    def __init__(self, cfg: dict, fake_audio: str | None = None,
+                 cfg_path: Path | None = None, overrides: dict | None = None) -> None:
         self.cfg = cfg
+        self.cfg_path = cfg_path
+        self.overrides = overrides or {}  # CLI flags; they win over the file on reload too
         self.recorder = make_recorder(fake_audio)
         self.rate = getattr(self.recorder, "rate", RATE)
-        self.client = SttClient(cfg["url"], cfg["api_key"], cfg["model"], cfg["raw"],
-                                cfg["dictionary"], cfg["style"])
+        self.client = SttClient.from_config(cfg)
         self.clip = Clipboard()
         self.state = "idle"          # idle | recording | busy
         self.lock = threading.Lock()
@@ -624,6 +703,11 @@ class Daemon:
         self.started_at = 0.0
         self.on_state = None         # tray hook: called with the new state
         self.on_quit = None          # tray hook: called when serve() ends
+        self.open_settings_on_start = False
+        self._hk_lock = threading.Lock()
+        self._listener = None        # the running pynput listener, so it can be stopped
+        self._hk_gen = 0             # bumps on every stop; a stale thread drops its listener
+        self._settings_proc: subprocess.Popen | None = None
 
     def _set_state(self, state: str) -> None:
         self.state = state
@@ -711,10 +795,55 @@ class Daemon:
             return self.stop()
         if cmd == "status":
             return self.state
+        if cmd == "reload":
+            return self.reload()
+        if cmd == "settings":
+            return self.open_settings()
+        if cmd == "hotkey-off":      # the Settings window is recording a new hotkey
+            self.hotkey_stop()
+            return "hotkey off"
+        if cmd == "hotkey-on":
+            return "hotkey on" if self.hotkey_ensure() else "hotkey unavailable"
         if cmd == "quit":
             self.stop_event.set()
             return "bye"
         return f"unknown command: {cmd}"
+
+    # ---- config ----
+    def reload(self) -> str:
+        if self.cfg_path is None:
+            return "error: no config file"
+        cfg = load_config(self.cfg_path)
+        cfg.update(self.overrides)
+        return self.apply_config(cfg)
+
+    def apply_config(self, cfg: dict) -> str:
+        """Use a new config without a restart; the hotkey is re-registered
+        only when it (or hold-to-talk) changed."""
+        old = self.cfg
+        self.client = SttClient.from_config(cfg)
+        self.cfg = cfg
+        if cfg["control_port"] != old["control_port"]:
+            log("control_port changes apply after a restart")
+        before = (normalize_hotkey(old["hotkey"]), old["hold_to_talk"])
+        if (normalize_hotkey(cfg["hotkey"]), cfg["hold_to_talk"]) != before:
+            self.hotkey_stop()
+        self.hotkey_ensure()
+        log(f"config reloaded → {self.client.endpoint}")
+        return "reloaded"
+
+    def open_settings(self) -> str:
+        """The Settings window runs as its own process (Tk wants the main
+        thread, which the tray owns) and sends `reload` when it saves."""
+        if self._settings_proc is not None and self._settings_proc.poll() is None:
+            return "settings already open"
+        args = ["settings"] + (["--config", str(self.cfg_path)] if self.cfg_path else [])
+        try:
+            self._settings_proc = subprocess.Popen(self_command(*args))
+        except Exception as e:
+            log(f"could not open settings: {e}")
+            return f"error: {e}"
+        return "settings opened"
 
     def serve(self) -> None:
         srv = control_listener()
@@ -745,25 +874,52 @@ class Daemon:
                     pass
 
     # ---- hotkey ----
+    _PENDING = object()             # a listener thread is starting
+
+    def hotkey_stop(self) -> None:
+        with self._hk_lock:
+            self._hk_gen += 1
+            lst, self._listener = self._listener, None
+        if lst is not None and lst is not self._PENDING:
+            try:
+                lst.stop()
+            except Exception as e:
+                log(f"hotkey stop failed: {e}")
+            log("hotkey off")
+
+    def hotkey_ensure(self) -> bool:
+        """Start the hotkey listener unless one is running (or starting)."""
+        with self._hk_lock:
+            if self._listener is not None:
+                return True
+        return self.hotkey_thread() is not None
+
     def hotkey_thread(self) -> threading.Thread | None:
         spec = normalize_hotkey(self.cfg["hotkey"])
         if IS_WAYLAND or not HAS_DISPLAY:
-            why = "Wayland session" if IS_WAYLAND else "no display"
-            log(f"global hotkey disabled ({why}). Bind a system shortcut to:\n"
-                f"    {sys.executable} {Path(__file__).resolve()} toggle\n"
-                "  GNOME: Settings → Keyboard → Custom Shortcuts.  KDE: System Settings → Shortcuts.")
+            if not getattr(self, "_hk_told", False):
+                self._hk_told = True
+                why = "Wayland session" if IS_WAYLAND else "no display"
+                log(f"global hotkey disabled ({why}). Bind a system shortcut to:\n"
+                    f"    {launch_command()} toggle\n"
+                    "  GNOME: Settings → Keyboard → Custom Shortcuts.  KDE: System Settings → Shortcuts.")
             return None
         try:
             from pynput import keyboard
         except Exception as e:
             log(f"pynput unavailable ({e}); hotkey disabled, control socket only")
             return None
+        with self._hk_lock:
+            gen = self._hk_gen
+            self._listener = self._PENDING
+        hold = self.cfg["hold_to_talk"]
 
         def run():
+            listener = None
             try:
                 if IS_WIN and "<cmd>" in spec.lower():
-                    self._win_cmd_hotkey_loop(spec)
-                elif self.cfg["hold_to_talk"]:
+                    listener = self._win_cmd_listener(spec, hold)
+                elif hold:
                     combo = set(keyboard.HotKey.parse(spec))
                     hk = keyboard.HotKey(list(combo), self.start)
 
@@ -776,27 +932,34 @@ class Daemon:
                         if ck in combo and self.state == "recording":
                             self.stop()
 
-                    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
-                        listener.join()
+                    listener = keyboard.Listener(on_press=on_press, on_release=on_release)
                 else:
-                    with keyboard.GlobalHotKeys({spec: self.toggle}) as h:
-                        h.join()
+                    listener = keyboard.GlobalHotKeys({spec: self.toggle})
+                with self._hk_lock:
+                    if gen != self._hk_gen:   # stopped while this thread was starting
+                        return
+                    self._listener = listener
+                with listener:
+                    listener.join()
             except Exception as e:
                 log(f"hotkey listener died: {e}")
+            finally:
+                with self._hk_lock:
+                    if gen == self._hk_gen and self._listener in (listener, self._PENDING):
+                        self._listener = None
 
         t = threading.Thread(target=run, daemon=True)
         t.start()
-        mode = "hold to talk" if self.cfg["hold_to_talk"] else "press to toggle"
+        mode = "hold to talk" if hold else "press to toggle"
         log(f"hotkey {spec} ({mode})")
         return t
 
-    def _win_cmd_hotkey_loop(self, spec: str) -> None:
+    def _win_cmd_listener(self, spec: str, hold: bool):
         """Win-key hotkeys need a low-level hook that swallows the letter so the
         Windows shortcut (Win+H = voice typing) never fires."""
         from pynput import keyboard
         from pynput.keyboard import Key
         kb = keyboard.Controller()
-        hold = self.cfg["hold_to_talk"]
 
         def fire(down: bool) -> None:
             if hold:
@@ -818,14 +981,17 @@ class Daemon:
             return True
 
         listener = keyboard.Listener(win32_event_filter=filt)
-        with listener:
-            listener.join()
+        return listener
 
     def run(self) -> None:
         log(f"orpheus desktop {VERSION} → {self.client.endpoint}")
         log(f"clipboard: {self.clip.backend}; paste: {'on' if self.cfg['paste'] else 'off'}; "
             f"control: {control_address()}")
-        self.hotkey_thread()
+        self.hotkey_ensure()
+        if self.open_settings_on_start:
+            # first run: no config yet. serve() binds the control socket right
+            # after this, well before anyone can press Save.
+            threading.Timer(0.5, self.open_settings).start()
         try:
             self.serve()
         except KeyboardInterrupt:
@@ -992,15 +1158,21 @@ _ADVANCED_KEY = r"Software\Microsoft\Windows\CurrentVersion\Explorer\Advanced"
 _OWN_KEY = r"Software\Orpheus\Desktop"
 
 
-def launch_command() -> str:
+def self_command(*args: str) -> list[str]:
+    """argv that runs this program again: the exe (wherever it was installed),
+    or python (pythonw on Windows, no console) plus this file."""
     if getattr(sys, "frozen", False):
-        return f'"{sys.executable}"'
+        return [sys.executable, *args]
     exe = Path(sys.executable)
     if IS_WIN:
         pyw = exe.with_name("pythonw.exe")
         if pyw.exists():
             exe = pyw
-    return f'"{exe}" "{Path(__file__).resolve()}"'
+    return [str(exe), str(Path(__file__).resolve()), *args]
+
+
+def launch_command() -> str:
+    return " ".join(f'"{a}"' for a in self_command())
 
 
 def autostart_desktop_path() -> Path:
@@ -1160,9 +1332,10 @@ def run_tray(daemon: "Daemon", cfg_path: Path) -> bool:
         pystray.MenuItem(lambda item: _ICON_LABELS[daemon.state], None, enabled=False),
         pystray.MenuItem("Toggle dictation", lambda: daemon.toggle(), default=True),
         pystray.Menu.SEPARATOR,
+        pystray.MenuItem("Settings...", lambda: daemon.open_settings()),
         pystray.MenuItem("Start with Windows" if IS_WIN else "Start at login",
                          toggle_autostart, checked=lambda item: autostart_enabled()),
-        pystray.MenuItem("Open config", lambda: open_path(cfg_path)),
+        pystray.MenuItem("Open config file", lambda: open_path(cfg_path)),
         pystray.MenuItem("Open failed takes folder", lambda: open_path(failed_dir())),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Quit", lambda: daemon.stop_event.set()),
@@ -1172,6 +1345,9 @@ def run_tray(daemon: "Daemon", cfg_path: Path) -> bool:
     except Exception as e:
         log(f"tray unavailable ({e.__class__.__name__}: {e}); running headless")
         return False
+    global _TRAY_NOTIFY
+    if IS_WIN and getattr(icon, "HAS_NOTIFICATION", False):
+        _TRAY_NOTIFY = lambda title, body: icon.notify(body, title)  # noqa: E731
     daemon.on_state = on_state
     daemon.on_quit = icon.stop
     worker = threading.Thread(target=daemon.run, daemon=True)
@@ -1181,6 +1357,7 @@ def run_tray(daemon: "Daemon", cfg_path: Path) -> bool:
     except Exception as e:
         log(f"tray failed ({e}); continuing headless")
         daemon.on_state = daemon.on_quit = None
+        _TRAY_NOTIFY = None
         worker.join()
     return True
 
@@ -1203,6 +1380,509 @@ def _attach_console() -> None:
         pass
 
 
+# ------------------------------------------------------------------ settings window
+
+_KEYSYM_MODS = {
+    "Control_L": "ctrl", "Control_R": "ctrl", "Alt_L": "alt", "Alt_R": "alt",
+    "Meta_L": "alt", "Meta_R": "alt", "Shift_L": "shift", "Shift_R": "shift",
+    "Win_L": "cmd", "Win_R": "cmd", "Super_L": "cmd", "Super_R": "cmd",
+}
+_KEYSYM_NAMES = {
+    "space": "space", "Return": "enter", "Tab": "tab", "BackSpace": "backspace",
+    "Insert": "insert", "Delete": "delete", "Home": "home", "End": "end",
+    "Prior": "page_up", "Next": "page_down", "Pause": "pause", "Scroll_Lock": "scroll_lock",
+}
+_MOD_ORDER = ("ctrl", "alt", "shift", "cmd")
+_FRIENDLY = {"ctrl": "Ctrl", "alt": "Alt", "shift": "Shift", "cmd": "Win" if IS_WIN else "Super",
+             "space": "Space", "enter": "Enter", "tab": "Tab", "backspace": "Backspace",
+             "insert": "Insert", "delete": "Delete", "home": "Home", "end": "End",
+             "page_up": "Page Up", "page_down": "Page Down", "pause": "Pause",
+             "scroll_lock": "Scroll Lock"}
+
+
+def hotkey_from_keys(mods: set[str], keysym: str) -> str | None:
+    """A key pressed in the Settings window → a hotkey spec.
+    ({'ctrl', 'alt'}, 'space') → '<ctrl>+<alt>+<space>'. None while only
+    modifiers are down, or for a key the hotkey code can't name. A bare
+    letter is refused (it would fire while typing); a bare F-key is fine."""
+    if keysym in _KEYSYM_MODS:
+        return None
+    if re.fullmatch(r"F([1-9]|1[0-2])", keysym):
+        key = f"<f{keysym[1:]}>"
+    elif keysym in _KEYSYM_NAMES:
+        key = f"<{_KEYSYM_NAMES[keysym]}>"
+    elif len(keysym) == 1 and keysym.isascii() and keysym.isalnum():
+        key = keysym.lower()
+    else:
+        return None
+    if not mods and not key.startswith("<f"):
+        return None
+    return "+".join([f"<{m}>" for m in _MOD_ORDER if m in mods] + [key])
+
+
+def friendly_hotkey(spec: str) -> str:
+    """'<cmd>+h' → 'Win + H' (Windows) / 'Super + H'."""
+    out = []
+    for part in normalize_hotkey(spec).split("+"):
+        name = part.strip().strip("<>").lower()
+        if not name:
+            continue
+        if re.fullmatch(r"f\d{1,2}", name):
+            out.append(name.upper())
+        else:
+            out.append(_FRIENDLY.get(name, name.upper() if len(name) == 1 else name))
+    return " + ".join(out)
+
+
+def hotkey_problem(spec: str) -> str | None:
+    """What's wrong with a hotkey, or None. Checked with the same parser the
+    daemon will use, when it's importable here."""
+    s = normalize_hotkey(spec.strip())
+    if not s:
+        return "Pick a hotkey."
+    if IS_WIN and "<cmd>" in s.lower():
+        try:
+            parse_win_hotkey(s)
+        except ValueError as e:
+            return f"{e}."
+        return None
+    try:
+        from pynput import keyboard
+    except Exception:
+        return None
+    try:
+        keyboard.HotKey.parse(s)
+    except ValueError as e:
+        return f"Not a hotkey: {e}."
+    return None
+
+
+def check_server(url: str, api_key: str = "", timeout: float = 5.0) -> tuple[bool, str]:
+    """The Settings window's Test button: can we reach the server, and does
+    it take the key? Orpheus servers also report their version."""
+    import requests
+    base = server_base(url)
+    if not base.startswith(("http://", "https://")):
+        return False, "The URL should start with http:// or https://"
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    what = ""
+    try:
+        r = requests.get(base + "/healthz", timeout=timeout)
+        if r.ok:
+            h = r.json()
+            if h.get("status") == "loading":
+                what = "Orpheus (still loading its model)"
+            elif h.get("version"):
+                what = f"Orpheus {h['version']}"
+    except requests.RequestException as e:
+        return False, f"Can't reach {base} ({e.__class__.__name__})."
+    except ValueError:
+        pass  # not an Orpheus server: /v1/models decides
+    try:
+        r = requests.get(base + "/v1/models", headers=headers, timeout=timeout)
+    except requests.RequestException as e:
+        return False, f"Can't reach {base}/v1 ({e.__class__.__name__})."
+    if r.status_code in (401, 403):
+        return False, ("The server wants an API key." if not api_key
+                       else "The server refused this API key.")
+    if not r.ok:
+        return False, f"{base}/v1/models answered HTTP {r.status_code}."
+    msg = f"Connected to {what}." if what else "Connected."
+    return True, msg + (" Key accepted." if api_key else "")
+
+
+def settings_available() -> bool:
+    if not HAS_DISPLAY:
+        return False
+    try:
+        import tkinter  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def config_problem(path: Path) -> str | None:
+    if not path.exists():
+        return None
+    try:
+        import tomllib
+        with open(path, "rb") as f:
+            tomllib.load(f)
+    except Exception as e:
+        return f"{path.name} has an error: {e}. Saving replaces it."
+    return None
+
+
+def run_settings(path: Path, smoke: bool = False) -> int:
+    if not settings_available():
+        log("the Settings window needs a display and tkinter; edit the config file instead: "
+            f"{path}")
+        if not path.exists():
+            write_template(path)
+        if HAS_DISPLAY:
+            open_path(path)
+        return 1
+    if IS_WIN:
+        try:  # crisp text on scaled displays instead of a blurry bitmap stretch
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+    import tkinter as tk
+    root = tk.Tk()
+    win = SettingsWindow(root, path, load_config(path), config_problem(path))
+    if smoke:
+        root.update_idletasks()
+        root.update()
+        log(f"settings window ok ({root.winfo_width()}x{root.winfo_height()})")
+        win.close()
+        return 0
+    root.mainloop()
+    return 0
+
+
+class SettingsWindow:
+    STYLES = (("Prose (default)", ""), ("Message (chat)", "message"),
+              ("Email", "email"), ("Code", "code"))
+    HOTKEY_HINT = "Click Record, then press the keys. Or type one, like <ctrl>+<alt>+<space>."
+
+    def __init__(self, root, path: Path, cfg: dict, problem: str | None = None) -> None:
+        import tkinter as tk
+        from tkinter import ttk
+        self.tk, self.root, self.path, self.cfg = tk, root, path, cfg
+        self.capturing = False
+        self._mods: set[str] = set()
+        self._before_capture = ""
+        self._test_result = None
+
+        root.title("Orpheus settings")
+        root.resizable(False, False)
+        style = ttk.Style(root)
+        if not IS_WIN and "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("Hint.TLabel", foreground="#666666")
+        style.configure("Bad.TLabel", foreground="#b00020")
+        style.configure("Good.TLabel", foreground="#1b6e20")
+        self._set_icon()
+
+        v = self.vars = {
+            "url": tk.StringVar(value=cfg["url"]),
+            "api_key": tk.StringVar(value=cfg["api_key"]),
+            "model": tk.StringVar(value=cfg["model"]),
+            "hotkey": tk.StringVar(value=cfg["hotkey"]),
+            "hold_to_talk": tk.BooleanVar(value=cfg["hold_to_talk"]),
+            "cleanup": tk.BooleanVar(value=not cfg["raw"]),
+            "style": tk.StringVar(value=self._style_label(cfg["style"])),
+            "keep_period": tk.BooleanVar(value=cfg["keep_period"]),
+            "paste": tk.BooleanVar(value=cfg["paste"]),
+            "restore_clipboard": tk.BooleanVar(value=cfg["restore_clipboard"]),
+            "sounds": tk.BooleanVar(value=cfg["sounds"]),
+            "autostart": tk.BooleanVar(value=autostart_enabled()),
+            "show_key": tk.BooleanVar(value=False),
+        }
+        self._autostart_was = v["autostart"].get()
+
+        outer = ttk.Frame(root, padding=16)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.columnconfigure((0, 1), weight=1)
+        # Two columns keep the window short enough for a 768-pixel screen at 125%:
+        # server, hotkey and general on the left, the text options on the right.
+        top = 0
+        if problem:
+            ttk.Label(outer, text=problem, style="Bad.TLabel", wraplength=760).grid(
+                row=0, column=0, columnspan=2, sticky="w", pady=(0, 8))
+            top = 1
+        outer.rowconfigure(top + 2, weight=1)
+
+        # --- server
+        srv = ttk.LabelFrame(outer, text="Server", padding=(12, 8))
+        srv.grid(row=top, column=0, sticky="new")
+        srv.columnconfigure(1, weight=1)
+        ttk.Label(srv, text="Server URL").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
+        url_entry = ttk.Entry(srv, textvariable=v["url"], width=38)
+        url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(srv, text="API key").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
+        self.key_entry = ttk.Entry(srv, textvariable=v["api_key"], show="*")
+        self.key_entry.grid(row=1, column=1, sticky="ew", pady=3)
+        ttk.Checkbutton(srv, text="Show", variable=v["show_key"],
+                        command=lambda: self.key_entry.configure(
+                            show="" if v["show_key"].get() else "*")).grid(
+            row=1, column=2, sticky="w", padx=(8, 0))
+        ttk.Label(srv, text="Model").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=3)
+        ttk.Entry(srv, textvariable=v["model"]).grid(row=2, column=1, columnspan=2, sticky="ew", pady=3)
+        ttk.Label(srv, text="Leave the key empty unless the server has one. Model is only "
+                            "for servers other than Orpheus.",
+                  style="Hint.TLabel", wraplength=320).grid(row=3, column=1, columnspan=2, sticky="w")
+        test_row = ttk.Frame(srv)
+        test_row.grid(row=4, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        self.test_btn = ttk.Button(test_row, text="Test connection", command=self.test)
+        self.test_btn.grid(row=0, column=0, sticky="w")
+        self.test_msg = ttk.Label(test_row, text="", wraplength=200)
+        self.test_msg.grid(row=0, column=1, sticky="w", padx=(10, 0))
+
+        # --- hotkey
+        hk = ttk.LabelFrame(outer, text="Hotkey", padding=(12, 8))
+        hk.grid(row=top + 1, column=0, sticky="new", pady=(12, 0))
+        hk.columnconfigure(3, weight=1)
+        ttk.Label(hk, text="Hotkey").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
+        self.hk_entry = ttk.Entry(hk, textvariable=v["hotkey"], width=22)
+        self.hk_entry.grid(row=0, column=1, sticky="w", pady=3)
+        self.record_btn = ttk.Button(hk, text="Record", command=self.toggle_capture)
+        self.record_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.hk_friendly = ttk.Label(hk, text="", width=18)   # fixed: the window doesn't jump
+        self.hk_friendly.grid(row=0, column=3, sticky="w", padx=(10, 0))
+        self.hk_hint = ttk.Label(hk, text=self.HOTKEY_HINT, style="Hint.TLabel", wraplength=320)
+        self.hk_hint.grid(row=1, column=1, columnspan=3, sticky="w")
+        ttk.Checkbutton(hk, text="Hold the hotkey to talk, let go to stop",
+                        variable=v["hold_to_talk"]).grid(row=2, column=0, columnspan=4,
+                                                         sticky="w", pady=(6, 0))
+        v["hotkey"].trace_add("write", lambda *_: self._show_friendly())
+        self._show_friendly()
+
+        # --- text
+        tx = ttk.LabelFrame(outer, text="Text", padding=(12, 8))
+        tx.grid(row=top, column=1, rowspan=3, sticky="nsew", padx=(14, 0))
+        tx.columnconfigure(1, weight=1)
+        tx.rowconfigure(6, weight=1)
+        ttk.Checkbutton(tx, text="Clean up with the server's AI pass\n(fillers out, punctuation in)",
+                        variable=v["cleanup"]).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(tx, text="Style").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(6, 3))
+        style_box = ttk.Combobox(tx, textvariable=v["style"], state="readonly", width=18,
+                                 values=[label for label, _ in self.STYLES])
+        style_box.grid(row=1, column=1, sticky="w", pady=(6, 3))
+        self.keep_cb = ttk.Checkbutton(tx, text="Keep the period on a one-sentence message",
+                                       variable=v["keep_period"])
+        self.keep_cb.grid(row=2, column=0, columnspan=3, sticky="w")
+        ttk.Checkbutton(tx, text="Paste into the window you're typing in",
+                        variable=v["paste"], command=self._sync_enabled).grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        self.restore_cb = ttk.Checkbutton(tx, text="Put the clipboard back afterwards",
+                                          variable=v["restore_clipboard"])
+        self.restore_cb.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0))
+        ttk.Label(tx, text="Personal dictionary").grid(row=5, column=0, columnspan=3, sticky="w",
+                                                       pady=(8, 2))
+        dict_frame = ttk.Frame(tx)
+        dict_frame.grid(row=6, column=0, columnspan=3, sticky="nsew")
+        dict_frame.columnconfigure(0, weight=1)
+        dict_frame.rowconfigure(0, weight=1)
+        self.dict_text = tk.Text(dict_frame, height=6, width=40, wrap="none", undo=True,
+                                 relief="solid", borderwidth=1, font="TkTextFont")
+        self.dict_text.grid(row=0, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(dict_frame, orient="vertical", command=self.dict_text.yview)
+        sb.grid(row=0, column=1, sticky="ns")
+        self.dict_text.configure(yscrollcommand=sb.set)
+        self.dict_text.insert("1.0", "\n".join(dictionary_entries(cfg["dictionary"])))
+        ttk.Label(tx, text="Names and terms to spell right, one per line. For a word the server "
+                           "keeps mishearing, write heard=meant (pie torch=PyTorch).",
+                  style="Hint.TLabel", wraplength=340).grid(row=7, column=0, columnspan=3,
+                                                            sticky="w", pady=(2, 0))
+        style_box.bind("<<ComboboxSelected>>", lambda e: self._sync_enabled())
+
+        # --- general
+        gen = ttk.LabelFrame(outer, text="General", padding=(12, 8))
+        gen.grid(row=top + 2, column=0, sticky="new", pady=(12, 0))
+        ttk.Checkbutton(gen, text="Beep when recording starts and stops",
+                        variable=v["sounds"]).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(gen, text="Start with Windows" if IS_WIN else "Start at login",
+                        variable=v["autostart"]).grid(row=1, column=0, sticky="w")
+
+        # --- buttons
+        bar = ttk.Frame(outer)
+        bar.grid(row=top + 3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
+        bar.columnconfigure(1, weight=1)
+        ttk.Button(bar, text="Open config file", command=self.open_file).grid(row=0, column=0,
+                                                                            sticky="w")
+        self.save_msg = ttk.Label(bar, text="", style="Bad.TLabel", wraplength=420)
+        self.save_msg.grid(row=0, column=1, sticky="e", padx=8)
+        ttk.Button(bar, text="Cancel", command=self.close).grid(row=0, column=2, padx=(0, 6))
+        self.save_btn = ttk.Button(bar, text="Save", command=self.save, default="active")
+        self.save_btn.grid(row=0, column=3)
+
+        self._sync_enabled()
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Escape>", lambda e: None if self.capturing else self.close())
+        url_entry.focus_set()
+
+    # ---- helpers ----
+    def _style_label(self, value: str) -> str:
+        for label, v in self.STYLES:
+            if v == (value or "").strip().lower():
+                return label
+        return self.STYLES[0][0]   # "", "prose", "auto": prose on the desktop
+
+    def _style_value(self) -> str:
+        return dict(self.STYLES).get(self.vars["style"].get(), "")
+
+    def _set_icon(self) -> None:
+        try:
+            import base64
+            buf = io.BytesIO()
+            make_icon_image("idle", 64).save(buf, "PNG")
+            self._icon = self.tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+            self.root.iconphoto(True, self._icon)
+        except Exception:
+            pass   # no Pillow: the default window icon
+
+    def _sync_enabled(self) -> None:
+        self.restore_cb.state(["!disabled"] if self.vars["paste"].get() else ["disabled"])
+        message = self._style_value() == "message"
+        self.keep_cb.state(["!disabled"] if message else ["disabled"])
+
+    def _show_friendly(self) -> None:
+        spec = self.vars["hotkey"].get()
+        self.hk_friendly.configure(text=friendly_hotkey(spec) if spec.strip() else "")
+
+    # ---- test connection (off the Tk thread; polled back in) ----
+    def test(self) -> None:
+        self.test_btn.state(["disabled"])
+        self.test_msg.configure(text="Testing...", style="TLabel")
+        url, key = self.vars["url"].get(), self.vars["api_key"].get().strip()
+        self._test_result = None
+
+        def work():
+            try:
+                self._test_result = check_server(url, key)
+            except Exception as e:
+                self._test_result = (False, f"Test failed: {e}")
+
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(100, self._poll_test)
+
+    def _poll_test(self) -> None:
+        if self._test_result is None:
+            self.root.after(100, self._poll_test)
+            return
+        ok, msg = self._test_result
+        self.test_msg.configure(text=msg, style="Good.TLabel" if ok else "Bad.TLabel")
+        self.test_btn.state(["!disabled"])
+
+    # ---- hotkey capture ----
+    def toggle_capture(self) -> None:
+        if self.capturing:
+            self._end_capture(cancel=True)
+            return
+        # the daemon would catch its own hotkey (and swallow it) while we listen
+        send_command("hotkey-off", quiet=True)
+        self.capturing = True
+        self._mods = set()
+        self._before_capture = self.vars["hotkey"].get()
+        self.vars["hotkey"].set("")
+        self.hk_friendly.configure(text="")
+        self.hk_hint.configure(text="Press the keys now. Esc cancels.")
+        self.record_btn.configure(text="Cancel")
+        # Keys go to the label: it has no class bindings of its own (a focused
+        # button would take Space as a click), and "break" stops the rest.
+        self.hk_friendly.bind("<KeyPress>", self._key_down)
+        self.hk_friendly.bind("<KeyRelease>", self._key_up)
+        self.hk_friendly.focus_set()
+
+    def _key_down(self, e):
+        if e.keysym == "Escape" and not self._mods:
+            self._end_capture(cancel=True)
+            return "break"
+        mod = _KEYSYM_MODS.get(e.keysym)
+        if mod:
+            self._mods.add(mod)
+            self.hk_friendly.configure(text=" + ".join(_FRIENDLY[m] for m in _MOD_ORDER
+                                                        if m in self._mods) + " + ...")
+            return "break"
+        spec = hotkey_from_keys(self._mods, e.keysym)
+        if spec:
+            self.vars["hotkey"].set(spec)
+            self._end_capture(cancel=False)
+        return "break"
+
+    def _key_up(self, e):
+        mod = _KEYSYM_MODS.get(e.keysym)
+        if mod:
+            self._mods.discard(mod)
+        return "break"
+
+    def _end_capture(self, cancel: bool) -> None:
+        self.hk_friendly.unbind("<KeyPress>")
+        self.hk_friendly.unbind("<KeyRelease>")
+        self.capturing = False
+        if cancel:
+            self.vars["hotkey"].set(self._before_capture)
+        self.record_btn.configure(text="Record")
+        self.hk_hint.configure(text=self.HOTKEY_HINT)
+        self.record_btn.focus_set()
+        self._show_friendly()
+        # back to the hotkey the daemon has now; a new one takes over on Save
+        send_command("hotkey-on", quiet=True)
+
+    # ---- save / close ----
+    def collect(self) -> dict:
+        v = self.vars
+        cfg = dict(self.cfg)
+        cfg.update({
+            "url": v["url"].get().strip(),
+            "api_key": v["api_key"].get().strip(),
+            "model": v["model"].get().strip(),
+            "hotkey": normalize_hotkey(v["hotkey"].get().strip()),
+            "hold_to_talk": v["hold_to_talk"].get(),
+            "raw": not v["cleanup"].get(),
+            "style": self._style_value(),
+            "keep_period": v["keep_period"].get(),
+            "paste": v["paste"].get(),
+            "restore_clipboard": v["restore_clipboard"].get(),
+            "sounds": v["sounds"].get(),
+            "dictionary": ", ".join(dictionary_entries(self.dict_text.get("1.0", "end"))),
+        })
+        return cfg
+
+    def save(self) -> None:
+        if self.capturing:
+            self._end_capture(cancel=True)
+        cfg = self.collect()
+        if not cfg["url"].startswith(("http://", "https://")):
+            self.save_msg.configure(text="The server URL should start with http:// or https://")
+            return
+        problem = hotkey_problem(cfg["hotkey"])
+        if problem:
+            self.save_msg.configure(text=problem)
+            return
+        try:
+            save_config(self.path, cfg)
+        except OSError as e:
+            self.save_msg.configure(text=f"Could not save: {e}")
+            return
+        log(f"settings saved: {self.path}")
+        if self.vars["autostart"].get() != self._autostart_was:
+            try:
+                autostart_set(self.vars["autostart"].get())
+            except Exception as e:
+                log(f"autostart change failed: {e}")
+        if send_command("reload", quiet=True) is None:
+            start_daemon(self.path)
+        self.root.destroy()
+
+    def open_file(self) -> None:
+        if not self.path.exists():
+            write_template(self.path)
+        open_path(self.path)
+
+    def close(self) -> None:
+        if self.capturing:
+            self._end_capture(cancel=True)
+        self.root.destroy()
+
+
+def start_daemon(path: Path) -> None:
+    """Saved from the Start menu's Settings with no daemon running: start it."""
+    args = [] if path == config_path() else ["--config", str(path)]
+    try:
+        if IS_WIN:
+            subprocess.Popen(self_command(*args), close_fds=True)
+        else:
+            subprocess.Popen(self_command(*args), start_new_session=True,
+                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+        log("daemon started")
+    except Exception as e:
+        log(f"could not start the daemon: {e}")
+
+
 # ------------------------------------------------------------------ cli
 
 def main(argv: list[str] | None = None) -> int:
@@ -1214,8 +1894,8 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     ap = argparse.ArgumentParser(description="Orpheus desktop push-to-talk dictation")
     ap.add_argument("command", nargs="?", default="daemon",
-                    choices=["daemon", "toggle", "start", "stop", "status", "quit", "transcribe",
-                             "install", "uninstall"])
+                    choices=["daemon", "settings", "toggle", "start", "stop", "status", "reload",
+                             "quit", "transcribe", "install", "uninstall"])
     ap.add_argument("file", nargs="?", help="WAV file for `transcribe`")
     ap.add_argument("--setup", action="store_true", help="write the config template and exit")
     ap.add_argument("--config", help="config file path")
@@ -1227,9 +1907,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-paste", action="store_true", help="clipboard only")
     ap.add_argument("--no-restore", action="store_true", help="don't restore the clipboard")
     ap.add_argument("--raw", action="store_true", help="skip the server's cleanup pass")
+    ap.add_argument("--keep-period", action="store_true",
+                    help="message style: keep the period on a one-sentence message")
     ap.add_argument("--quiet", action="store_true", help="no beeps")
     ap.add_argument("--fake-audio", metavar="WAV", help="use this WAV instead of the mic (testing)")
     ap.add_argument("--no-tray", action="store_true", help="headless daemon, no tray icon")
+    ap.add_argument("--smoke", action="store_true", help=argparse.SUPPRESS)  # CI: build the window, close it
     ap.add_argument("--version", action="store_true", help="print the version")
     a = ap.parse_args(argv)
 
@@ -1245,33 +1928,45 @@ def main(argv: list[str] | None = None) -> int:
         install(a.command == "install")
         return 0
 
-    if a.command in ("toggle", "start", "stop", "status", "quit"):
+    first_run = not path.exists()
+    cfg = load_config(path)
+    # read before the control commands so a custom control_port reaches them too
+    DEFAULTS["control_port"] = int(cfg["control_port"])
+
+    if a.command == "settings":
+        return run_settings(path, smoke=a.smoke)
+
+    if a.command in ("toggle", "start", "stop", "status", "reload", "quit"):
         reply = send_command(a.command)
         if reply is None:
             return 1
         print(reply)
+        if a.command == "quit":
+            wait_daemon_gone()
         return 0
 
-    cfg = load_config(path)
+    overrides = {}
     if a.url:
-        cfg["url"] = a.url
+        overrides["url"] = a.url
     if a.api_key is not None:
-        cfg["api_key"] = a.api_key
+        overrides["api_key"] = a.api_key
     if a.model is not None:
-        cfg["model"] = a.model
+        overrides["model"] = a.model
     if a.hotkey:
-        cfg["hotkey"] = a.hotkey
+        overrides["hotkey"] = a.hotkey
     if a.hold:
-        cfg["hold_to_talk"] = True
+        overrides["hold_to_talk"] = True
     if a.no_paste:
-        cfg["paste"] = False
+        overrides["paste"] = False
     if a.no_restore:
-        cfg["restore_clipboard"] = False
+        overrides["restore_clipboard"] = False
     if a.raw:
-        cfg["raw"] = True
+        overrides["raw"] = True
+    if a.keep_period:
+        overrides["keep_period"] = True
     if a.quiet:
-        cfg["sounds"] = False
-    DEFAULTS["control_port"] = int(cfg["control_port"])
+        overrides["sounds"] = False
+    cfg.update(overrides)
 
     if a.command == "transcribe":
         if not a.file:
@@ -1280,8 +1975,7 @@ def main(argv: list[str] | None = None) -> int:
         if is_silence(rec.pcm, rec.rate):
             log("heard nothing (silence)")
             return 2
-        client = SttClient(cfg["url"], cfg["api_key"], cfg["model"], cfg["raw"],
-                                cfg["dictionary"], cfg["style"])
+        client = SttClient.from_config(cfg)
         t0 = time.monotonic()
         try:
             text = client.transcribe(wav_bytes(rec.pcm, rec.rate), rec.rate)
@@ -1293,10 +1987,26 @@ def main(argv: list[str] | None = None) -> int:
         print(text)
         return 0
 
-    daemon = Daemon(cfg, a.fake_audio)
+    daemon = Daemon(cfg, a.fake_audio, cfg_path=path, overrides=overrides)
+    if first_run:
+        if settings_available():
+            daemon.open_settings_on_start = True
+        else:
+            write_template(path)   # no window to show: the file is the settings
     if a.no_tray or not run_tray(daemon, path):
         daemon.run()
     return 0
+
+
+def wait_daemon_gone(timeout: float = 5.0) -> None:
+    """`quit` returns once the daemon has really let go (the installer and the
+    uninstaller replace or delete its files right after)."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if send_command("status", quiet=True) is None:
+            time.sleep(0.3)   # socket closed; give the process a moment to exit
+            return
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":
