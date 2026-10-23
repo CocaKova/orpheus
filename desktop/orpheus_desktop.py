@@ -124,10 +124,22 @@ control_port = @control_port@
 _LOG_FILE: Path | None = None
 
 
+def console(text: str) -> None:
+    """print(), but a character the console can't encode becomes '?' instead of an error.
+    Windows hands a redirected stdout (a pipe, a file, CI) the legacy code page, and
+    cp1252 has no '→', no emoji and no non-Latin script."""
+    if sys.stdout is None:
+        return
+    try:
+        print(text, flush=True)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(enc, "replace").decode(enc, "replace"), flush=True)
+
+
 def log(msg: str) -> None:
     line = f"[orpheus] {msg}"
-    if sys.stdout is not None:
-        print(line, flush=True)
+    console(line)
     if sys.stdout is None or getattr(sys, "frozen", False):
         _log_to_file(line)
 
@@ -2310,7 +2322,7 @@ def main(argv: list[str] | None = None) -> int:
         reply = send_command(a.command)
         if reply is None:
             return 1
-        print(reply)
+        console(reply)
         if a.command == "quit":
             wait_daemon_gone()
         return 0
@@ -2354,7 +2366,7 @@ def main(argv: list[str] | None = None) -> int:
             log(f"failed: {e}\n  take saved: {saved}")
             return 1
         log(f"{time.monotonic() - t0:.1f}s")
-        print(text)
+        console(text)
         return 0
 
     daemon = Daemon(cfg, a.fake_audio, cfg_path=path, overrides=overrides)

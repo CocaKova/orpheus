@@ -183,6 +183,17 @@ eq(d.handle("hotkey-on"), "hotkey unavailable")         # no display in here
 eq(d.handle("hotkey-off"), "hotkey off")
 eq(od.Daemon(dict(od.DEFAULTS), str(wav)).handle("reload"), "error: no config file")
 
+# --- a console in a legacy code page (Windows, redirected: cp1252) still gets the line
+import io, sys  # noqa: E401,E402
+real, buf = sys.stdout, io.BytesIO()
+sys.stdout = cp = io.TextIOWrapper(buf, encoding="cp1252", newline="\n")
+try:
+    od.log("reloaded → http://box:8123 … Ünïcode")
+finally:
+    sys.stdout = real
+cp.detach()                              # keep buf open once the wrapper is dropped
+eq(buf.getvalue().decode("cp1252"), "[orpheus] reloaded ? http://box:8123 … Ünïcode\n")
+
 # --- self_command runs this file again with the same python
 cmd = od.self_command("settings")
 eq(cmd[-1], "settings")
