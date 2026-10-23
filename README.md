@@ -29,6 +29,9 @@ clients point at your own server, the audio and the text stay on your network.
 Because the server speaks the OpenAI transcription API, any client with a configurable
 speech-to-text URL works too. Point it at `http://your-host:8123`.
 
+Orpheus is MIT. The third-party software in the Windows build, and its licenses, is listed in
+[THIRD-PARTY.md](THIRD-PARTY.md).
+
 ## Quick start
 
 ### 1. The server

@@ -1513,6 +1513,80 @@ def config_problem(path: Path) -> str | None:
     return None
 
 
+def pill_label(state: str, msg: str = "") -> str:
+    """The header pill's few words for a Test result (the full message sits
+    under the Test button)."""
+    if state == "ok":
+        m = re.search(r"Orpheus \d+(?:\.\d+)*", msg)
+        return "Connected" + (f" · {m.group(0)}" if m else "")
+    if state == "bad":
+        if "refused this API key" in msg:
+            return "Key refused"
+        if "wants an API key" in msg:
+            return "Needs a key"
+        return "Not connected"
+    return "Testing..." if state == "testing" else "Not tested"
+
+
+def test_detail(state: str, msg: str) -> str:
+    """The line under the Test button when the pill already says the gist:
+    a failure in full, on success only what the pill doesn't (the key)."""
+    if state == "bad":
+        return msg
+    if state == "ok":
+        return msg.split(". ", 1)[1] if msg.startswith("Connected to") and ". " in msg else ""
+    return ""
+
+
+def ui_fonts(root) -> dict:
+    """Font families for the Settings window: Segoe UI Variable on Windows 11,
+    Segoe UI on Windows 10, the best installed modern sans elsewhere."""
+    from tkinter import font as tkfont
+    fams = set(tkfont.families(root))
+
+    def first(*names):
+        return next((n for n in names if n in fams), None)
+
+    body = first("Segoe UI Variable Text", "Segoe UI", "Ubuntu Sans", "Inter", "Cantarell",
+                 "Noto Sans", "DejaVu Sans") or "TkDefaultFont"
+    strong = first("Segoe UI Variable Text Semibold")
+    display = first("Segoe UI Variable Display Semibold")
+    return {
+        "body": body,
+        "strong": (strong, "normal") if strong else (body, "bold"),
+        "display": (display, "normal") if display else (body, "bold"),
+    }
+
+
+def win_title_bar(root, dark: bool, caption: str | None = None) -> None:
+    """Windows: a dark title bar in dark mode (DWMWA_USE_IMMERSIVE_DARK_MODE),
+    and optionally the title bar's colour (Windows 11 only). No-op elsewhere."""
+    if not IS_WIN:
+        return
+    try:
+        import ctypes
+        root.update_idletasks()
+        hwnd = ctypes.windll.user32.GetParent(root.winfo_id())
+        dwm = ctypes.windll.dwmapi
+        on = ctypes.c_int(1 if dark else 0)
+        for attr in (20, 19):   # 19 on Windows 10 builds before 20H1
+            if dwm.DwmSetWindowAttribute(hwnd, attr, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                break
+        if caption:
+            r, g, b = (int(caption[i:i + 2], 16) for i in (1, 3, 5))
+            color = ctypes.c_int(r | g << 8 | b << 16)   # COLORREF 0x00BBGGRR
+            dwm.DwmSetWindowAttribute(hwnd, 35, ctypes.byref(color), ctypes.sizeof(color))
+    except Exception:
+        pass
+
+
+def _png_photo(tk, img):
+    import base64
+    buf = io.BytesIO()
+    img.save(buf, "PNG")
+    return tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
+
+
 def run_settings(path: Path, smoke: bool = False) -> int:
     if not settings_available():
         log("the Settings window needs a display and tkinter; edit the config file instead: "
@@ -1528,13 +1602,15 @@ def run_settings(path: Path, smoke: bool = False) -> int:
             ctypes.windll.shcore.SetProcessDpiAwareness(1)
         except Exception:
             pass
-    import tkinter as tk
-    root = tk.Tk()
-    win = SettingsWindow(root, path, load_config(path), config_problem(path))
+    cls = OrpheusSettings if OrpheusSettings.available() else SettingsWindow
+    root = cls.make_root()
+    root.withdraw()             # dressed first, then shown: no flash of the plain window
+    win = cls(root, path, load_config(path), config_problem(path))
+    root.deiconify()
     if smoke:
         root.update_idletasks()
         root.update()
-        log(f"settings window ok ({root.winfo_width()}x{root.winfo_height()})")
+        log(f"settings window ok ({cls.__name__}, {root.winfo_width()}x{root.winfo_height()})")
         win.close()
         return 0
     root.mainloop()
@@ -1542,29 +1618,36 @@ def run_settings(path: Path, smoke: bool = False) -> int:
 
 
 class SettingsWindow:
+    """The Settings window: its behaviour, plus the plain ttk look as the
+    fallback view. A look subclass overrides make_root(), build() and the
+    small view hooks under it; Test, hotkey capture and Save are shared."""
+
     STYLES = (("Prose (default)", ""), ("Message (chat)", "message"),
               ("Email", "email"), ("Code", "code"))
     HOTKEY_HINT = "Click Record, then press the keys. Or type one, like <ctrl>+<alt>+<space>."
+    DICT_HINT = ("Names and terms to spell right, one per line. For a word the server keeps "
+                 "mishearing, write heard=meant (pie torch=PyTorch).")
+
+    @classmethod
+    def available(cls) -> bool:
+        return True
+
+    @staticmethod
+    def make_root():
+        import tkinter as tk
+        return tk.Tk()
 
     def __init__(self, root, path: Path, cfg: dict, problem: str | None = None) -> None:
         import tkinter as tk
-        from tkinter import ttk
         self.tk, self.root, self.path, self.cfg = tk, root, path, cfg
         self.capturing = False
         self._mods: set[str] = set()
         self._before_capture = ""
         self._test_result = None
+        self._testing = False
 
         root.title("Orpheus settings")
         root.resizable(False, False)
-        style = ttk.Style(root)
-        if not IS_WIN and "clam" in style.theme_names():
-            style.theme_use("clam")
-        style.configure("Hint.TLabel", foreground="#666666")
-        style.configure("Bad.TLabel", foreground="#b00020")
-        style.configure("Good.TLabel", foreground="#1b6e20")
-        self._set_icon()
-
         v = self.vars = {
             "url": tk.StringVar(value=cfg["url"]),
             "api_key": tk.StringVar(value=cfg["api_key"]),
@@ -1582,11 +1665,41 @@ class SettingsWindow:
         }
         self._autostart_was = v["autostart"].get()
 
+        self.build(problem)
+
+        v["hotkey"].trace_add("write", lambda *_: self._show_friendly())
+        v["paste"].trace_add("write", lambda *_: self._sync_enabled())
+        v["style"].trace_add("write", lambda *_: self._sync_enabled())
+        v["show_key"].trace_add("write", lambda *_: self.key_entry.configure(
+            show="" if v["show_key"].get() else "*"))
+        for k in ("url", "api_key"):   # an edit makes the last Test result stale
+            v[k].trace_add("write", lambda *_: self._untested())
+        self._show_friendly()
+        self._sync_enabled()
+        self.show_test("idle", "")
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.bind("<Escape>", lambda e: None if self.capturing else self.close())
+        self.url_entry.focus_set()
+
+    # ---- the plain look (fallback) ----
+    def build(self, problem: str | None) -> None:
+        tk, root, v = self.tk, self.root, self.vars
+        from tkinter import ttk
+        style = ttk.Style(root)
+        if not IS_WIN and "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("Hint.TLabel", foreground="#666666")
+        style.configure("Bad.TLabel", foreground="#b00020")
+        style.configure("Good.TLabel", foreground="#1b6e20")
+        try:
+            self._icon = _png_photo(tk, make_icon_image("idle", 64))
+            root.iconphoto(True, self._icon)
+        except Exception:
+            pass
+
         outer = ttk.Frame(root, padding=16)
         outer.grid(row=0, column=0, sticky="nsew")
         outer.columnconfigure((0, 1), weight=1)
-        # Two columns keep the window short enough for a 768-pixel screen at 125%:
-        # server, hotkey and general on the left, the text options on the right.
         top = 0
         if problem:
             ttk.Label(outer, text=problem, style="Bad.TLabel", wraplength=760).grid(
@@ -1594,19 +1707,16 @@ class SettingsWindow:
             top = 1
         outer.rowconfigure(top + 2, weight=1)
 
-        # --- server
         srv = ttk.LabelFrame(outer, text="Server", padding=(12, 8))
         srv.grid(row=top, column=0, sticky="new")
         srv.columnconfigure(1, weight=1)
         ttk.Label(srv, text="Server URL").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
-        url_entry = ttk.Entry(srv, textvariable=v["url"], width=38)
-        url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=3)
+        self.url_entry = ttk.Entry(srv, textvariable=v["url"], width=38)
+        self.url_entry.grid(row=0, column=1, columnspan=2, sticky="ew", pady=3)
         ttk.Label(srv, text="API key").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=3)
         self.key_entry = ttk.Entry(srv, textvariable=v["api_key"], show="*")
         self.key_entry.grid(row=1, column=1, sticky="ew", pady=3)
-        ttk.Checkbutton(srv, text="Show", variable=v["show_key"],
-                        command=lambda: self.key_entry.configure(
-                            show="" if v["show_key"].get() else "*")).grid(
+        ttk.Checkbutton(srv, text="Show", variable=v["show_key"]).grid(
             row=1, column=2, sticky="w", padx=(8, 0))
         ttk.Label(srv, text="Model").grid(row=2, column=0, sticky="w", padx=(0, 10), pady=3)
         ttk.Entry(srv, textvariable=v["model"]).grid(row=2, column=1, columnspan=2, sticky="ew", pady=3)
@@ -1620,13 +1730,11 @@ class SettingsWindow:
         self.test_msg = ttk.Label(test_row, text="", wraplength=200)
         self.test_msg.grid(row=0, column=1, sticky="w", padx=(10, 0))
 
-        # --- hotkey
         hk = ttk.LabelFrame(outer, text="Hotkey", padding=(12, 8))
         hk.grid(row=top + 1, column=0, sticky="new", pady=(12, 0))
         hk.columnconfigure(3, weight=1)
         ttk.Label(hk, text="Hotkey").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=3)
-        self.hk_entry = ttk.Entry(hk, textvariable=v["hotkey"], width=22)
-        self.hk_entry.grid(row=0, column=1, sticky="w", pady=3)
+        ttk.Entry(hk, textvariable=v["hotkey"], width=22).grid(row=0, column=1, sticky="w", pady=3)
         self.record_btn = ttk.Button(hk, text="Record", command=self.toggle_capture)
         self.record_btn.grid(row=0, column=2, sticky="w", padx=(8, 0))
         self.hk_friendly = ttk.Label(hk, text="", width=18)   # fixed: the window doesn't jump
@@ -1636,10 +1744,8 @@ class SettingsWindow:
         ttk.Checkbutton(hk, text="Hold the hotkey to talk, let go to stop",
                         variable=v["hold_to_talk"]).grid(row=2, column=0, columnspan=4,
                                                          sticky="w", pady=(6, 0))
-        v["hotkey"].trace_add("write", lambda *_: self._show_friendly())
-        self._show_friendly()
+        self.key_sink = self.hk_friendly
 
-        # --- text
         tx = ttk.LabelFrame(outer, text="Text", padding=(12, 8))
         tx.grid(row=top, column=1, rowspan=3, sticky="nsew", padx=(14, 0))
         tx.columnconfigure(1, weight=1)
@@ -1647,15 +1753,15 @@ class SettingsWindow:
         ttk.Checkbutton(tx, text="Clean up with the server's AI pass\n(fillers out, punctuation in)",
                         variable=v["cleanup"]).grid(row=0, column=0, columnspan=3, sticky="w")
         ttk.Label(tx, text="Style").grid(row=1, column=0, sticky="w", padx=(0, 10), pady=(6, 3))
-        style_box = ttk.Combobox(tx, textvariable=v["style"], state="readonly", width=18,
-                                 values=[label for label, _ in self.STYLES])
-        style_box.grid(row=1, column=1, sticky="w", pady=(6, 3))
+        ttk.Combobox(tx, textvariable=v["style"], state="readonly", width=18,
+                     values=[label for label, _ in self.STYLES]).grid(row=1, column=1, sticky="w",
+                                                                      pady=(6, 3))
         self.keep_cb = ttk.Checkbutton(tx, text="Keep the period on a one-sentence message",
                                        variable=v["keep_period"])
         self.keep_cb.grid(row=2, column=0, columnspan=3, sticky="w")
         ttk.Checkbutton(tx, text="Paste into the window you're typing in",
-                        variable=v["paste"], command=self._sync_enabled).grid(
-            row=3, column=0, columnspan=3, sticky="w", pady=(6, 0))
+                        variable=v["paste"]).grid(row=3, column=0, columnspan=3, sticky="w",
+                                                  pady=(6, 0))
         self.restore_cb = ttk.Checkbutton(tx, text="Put the clipboard back afterwards",
                                           variable=v["restore_clipboard"])
         self.restore_cb.grid(row=4, column=0, columnspan=3, sticky="w", padx=(20, 0))
@@ -1671,14 +1777,10 @@ class SettingsWindow:
         sb = ttk.Scrollbar(dict_frame, orient="vertical", command=self.dict_text.yview)
         sb.grid(row=0, column=1, sticky="ns")
         self.dict_text.configure(yscrollcommand=sb.set)
-        self.dict_text.insert("1.0", "\n".join(dictionary_entries(cfg["dictionary"])))
-        ttk.Label(tx, text="Names and terms to spell right, one per line. For a word the server "
-                           "keeps mishearing, write heard=meant (pie torch=PyTorch).",
-                  style="Hint.TLabel", wraplength=340).grid(row=7, column=0, columnspan=3,
-                                                            sticky="w", pady=(2, 0))
-        style_box.bind("<<ComboboxSelected>>", lambda e: self._sync_enabled())
+        self.dict_text.insert("1.0", "\n".join(dictionary_entries(self.cfg["dictionary"])))
+        ttk.Label(tx, text=self.DICT_HINT, style="Hint.TLabel", wraplength=340).grid(
+            row=7, column=0, columnspan=3, sticky="w", pady=(2, 0))
 
-        # --- general
         gen = ttk.LabelFrame(outer, text="General", padding=(12, 8))
         gen.grid(row=top + 2, column=0, sticky="new", pady=(12, 0))
         ttk.Checkbutton(gen, text="Beep when recording starts and stops",
@@ -1686,7 +1788,6 @@ class SettingsWindow:
         ttk.Checkbutton(gen, text="Start with Windows" if IS_WIN else "Start at login",
                         variable=v["autostart"]).grid(row=1, column=0, sticky="w")
 
-        # --- buttons
         bar = ttk.Frame(outer)
         bar.grid(row=top + 3, column=0, columnspan=2, sticky="ew", pady=(14, 0))
         bar.columnconfigure(1, weight=1)
@@ -1695,13 +1796,25 @@ class SettingsWindow:
         self.save_msg = ttk.Label(bar, text="", style="Bad.TLabel", wraplength=420)
         self.save_msg.grid(row=0, column=1, sticky="e", padx=8)
         ttk.Button(bar, text="Cancel", command=self.close).grid(row=0, column=2, padx=(0, 6))
-        self.save_btn = ttk.Button(bar, text="Save", command=self.save, default="active")
-        self.save_btn.grid(row=0, column=3)
+        ttk.Button(bar, text="Save", command=self.save, default="active").grid(row=0, column=3)
 
-        self._sync_enabled()
-        root.protocol("WM_DELETE_WINDOW", self.close)
-        root.bind("<Escape>", lambda e: None if self.capturing else self.close())
-        url_entry.focus_set()
+    # ---- view hooks: the looks override these ----
+    def set_enabled(self, widget, on: bool) -> None:
+        widget.state(["!disabled"] if on else ["disabled"])
+
+    def set_text(self, widget, text: str) -> None:
+        widget.configure(text=text)
+
+    def show_test(self, state: str, msg: str) -> None:
+        """state: idle | testing | ok | bad."""
+        style = {"ok": "Good.TLabel", "bad": "Bad.TLabel"}.get(state, "TLabel")
+        self.test_msg.configure(text=msg, style=style)
+
+    def show_error(self, msg: str) -> None:
+        self.save_msg.configure(text=msg)
+
+    def dictionary_text(self) -> str:
+        return self.dict_text.get("1.0", "end")
 
     # ---- helpers ----
     def _style_label(self, value: str) -> str:
@@ -1713,29 +1826,25 @@ class SettingsWindow:
     def _style_value(self) -> str:
         return dict(self.STYLES).get(self.vars["style"].get(), "")
 
-    def _set_icon(self) -> None:
-        try:
-            import base64
-            buf = io.BytesIO()
-            make_icon_image("idle", 64).save(buf, "PNG")
-            self._icon = self.tk.PhotoImage(data=base64.b64encode(buf.getvalue()))
-            self.root.iconphoto(True, self._icon)
-        except Exception:
-            pass   # no Pillow: the default window icon
-
     def _sync_enabled(self) -> None:
-        self.restore_cb.state(["!disabled"] if self.vars["paste"].get() else ["disabled"])
-        message = self._style_value() == "message"
-        self.keep_cb.state(["!disabled"] if message else ["disabled"])
+        self.set_enabled(self.restore_cb, self.vars["paste"].get())
+        self.set_enabled(self.keep_cb, self._style_value() == "message")
 
     def _show_friendly(self) -> None:
+        if self.capturing:
+            return
         spec = self.vars["hotkey"].get()
-        self.hk_friendly.configure(text=friendly_hotkey(spec) if spec.strip() else "")
+        self.set_text(self.hk_friendly, friendly_hotkey(spec) if spec.strip() else "")
+
+    def _untested(self) -> None:
+        if not self._testing:
+            self.show_test("idle", "")
 
     # ---- test connection (off the Tk thread; polled back in) ----
     def test(self) -> None:
-        self.test_btn.state(["disabled"])
-        self.test_msg.configure(text="Testing...", style="TLabel")
+        self._testing = True
+        self.set_enabled(self.test_btn, False)
+        self.show_test("testing", "Testing...")
         url, key = self.vars["url"].get(), self.vars["api_key"].get().strip()
         self._test_result = None
 
@@ -1753,8 +1862,9 @@ class SettingsWindow:
             self.root.after(100, self._poll_test)
             return
         ok, msg = self._test_result
-        self.test_msg.configure(text=msg, style="Good.TLabel" if ok else "Bad.TLabel")
-        self.test_btn.state(["!disabled"])
+        self._testing = False
+        self.show_test("ok" if ok else "bad", msg)
+        self.set_enabled(self.test_btn, True)
 
     # ---- hotkey capture ----
     def toggle_capture(self) -> None:
@@ -1767,14 +1877,14 @@ class SettingsWindow:
         self._mods = set()
         self._before_capture = self.vars["hotkey"].get()
         self.vars["hotkey"].set("")
-        self.hk_friendly.configure(text="")
-        self.hk_hint.configure(text="Press the keys now. Esc cancels.")
-        self.record_btn.configure(text="Cancel")
-        # Keys go to the label: it has no class bindings of its own (a focused
-        # button would take Space as a click), and "break" stops the rest.
-        self.hk_friendly.bind("<KeyPress>", self._key_down)
-        self.hk_friendly.bind("<KeyRelease>", self._key_up)
-        self.hk_friendly.focus_set()
+        self.set_text(self.hk_friendly, "")
+        self.set_text(self.hk_hint, "Press the keys now. Esc cancels.")
+        self.set_text(self.record_btn, "Cancel")
+        # Keys go to a widget with no key bindings of its own (a focused button
+        # would take Space as a click), and "break" stops the rest.
+        self.key_sink.bind("<KeyPress>", self._key_down)
+        self.key_sink.bind("<KeyRelease>", self._key_up)
+        self.key_sink.focus_set()
 
     def _key_down(self, e):
         if e.keysym == "Escape" and not self._mods:
@@ -1783,7 +1893,7 @@ class SettingsWindow:
         mod = _KEYSYM_MODS.get(e.keysym)
         if mod:
             self._mods.add(mod)
-            self.hk_friendly.configure(text=" + ".join(_FRIENDLY[m] for m in _MOD_ORDER
+            self.set_text(self.hk_friendly, " + ".join(_FRIENDLY[m] for m in _MOD_ORDER
                                                         if m in self._mods) + " + ...")
             return "break"
         spec = hotkey_from_keys(self._mods, e.keysym)
@@ -1799,13 +1909,13 @@ class SettingsWindow:
         return "break"
 
     def _end_capture(self, cancel: bool) -> None:
-        self.hk_friendly.unbind("<KeyPress>")
-        self.hk_friendly.unbind("<KeyRelease>")
+        self.key_sink.unbind("<KeyPress>")
+        self.key_sink.unbind("<KeyRelease>")
         self.capturing = False
         if cancel:
             self.vars["hotkey"].set(self._before_capture)
-        self.record_btn.configure(text="Record")
-        self.hk_hint.configure(text=self.HOTKEY_HINT)
+        self.set_text(self.record_btn, "Record")
+        self.set_text(self.hk_hint, self.HOTKEY_HINT)
         self.record_btn.focus_set()
         self._show_friendly()
         # back to the hotkey the daemon has now; a new one takes over on Save
@@ -1827,7 +1937,7 @@ class SettingsWindow:
             "paste": v["paste"].get(),
             "restore_clipboard": v["restore_clipboard"].get(),
             "sounds": v["sounds"].get(),
-            "dictionary": ", ".join(dictionary_entries(self.dict_text.get("1.0", "end"))),
+            "dictionary": ", ".join(dictionary_entries(self.dictionary_text())),
         })
         return cfg
 
@@ -1836,16 +1946,16 @@ class SettingsWindow:
             self._end_capture(cancel=True)
         cfg = self.collect()
         if not cfg["url"].startswith(("http://", "https://")):
-            self.save_msg.configure(text="The server URL should start with http:// or https://")
+            self.show_error("The server URL should start with http:// or https://")
             return
         problem = hotkey_problem(cfg["hotkey"])
         if problem:
-            self.save_msg.configure(text=problem)
+            self.show_error(problem)
             return
         try:
             save_config(self.path, cfg)
         except OSError as e:
-            self.save_msg.configure(text=f"Could not save: {e}")
+            self.show_error(f"Could not save: {e}")
             return
         log(f"settings saved: {self.path}")
         if self.vars["autostart"].get() != self._autostart_was:
@@ -1866,6 +1976,263 @@ class SettingsWindow:
         if self.capturing:
             self._end_capture(cancel=True)
         self.root.destroy()
+
+
+SERVER_HINT = "Both optional: a key only if the server has one, a model only for servers other than Orpheus."
+HOTKEY_HINT_SHORT = "Click Record and press the keys, or type one like <ctrl>+<alt>+<space>."
+
+
+# The Android app's palette (android/.../MainActivity.kt, "theme").
+_ORPHEUS = {
+    "night": "#0F0D19", "raised": "#181427", "card": "#1E1B2E", "violet": "#B39DFF",
+    "violet_deep": "#7C6CF0", "mint": "#5EE0A0", "amber": "#FFC46B", "ink": "#ECE7FF",
+    "muted": "#9D96B8", "outline": "#3B3552", "error": "#FF6B6B",
+}
+
+
+def _tint(hex_fg: str, hex_bg: str, a: float) -> str:
+    """hex_fg laid over hex_bg at opacity a (pill backgrounds)."""
+    fg = [int(hex_fg[i:i + 2], 16) for i in (1, 3, 5)]
+    bg = [int(hex_bg[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(f * a + b * (1 - a)):02x}" for f, b in zip(fg, bg))
+
+
+class OrpheusSettings(SettingsWindow):
+    """The Orpheus look: the phone app's night-and-violet palette, rounded
+    cards and switches. Dark only, like the phone app. Uses CustomTkinter (MIT,
+    Tom Schimansky); see THIRD-PARTY.md. Without it the plain ttk look above
+    still works. On Linux, CustomTkinter copies its
+    fonts into ~/.fonts the first time it runs (on Windows it loads them
+    privately)."""
+
+    HOTKEY_HINT = HOTKEY_HINT_SHORT
+
+    @classmethod
+    def available(cls) -> bool:
+        try:
+            import customtkinter  # noqa: F401
+            return True
+        except Exception:
+            return False
+
+    @staticmethod
+    def make_root():
+        import customtkinter as ctk
+        ctk.set_appearance_mode("dark")
+        return ctk.CTk(fg_color=_ORPHEUS["night"])
+
+    def build(self, problem: str | None) -> None:
+        import customtkinter as ctk
+        tk, root, v, P = self.tk, self.root, self.vars, _ORPHEUS
+        win_title_bar(root, True, caption=P["night"])
+        f = ui_fonts(root)
+
+        def cfont(size, spec=None, **kw):
+            fam, weight = spec if spec else (f["body"], "normal")
+            return ctk.CTkFont(family=fam, size=size,
+                               weight="bold" if weight == "bold" else "normal", **kw)
+
+        body, small = cfont(14), cfont(12)
+        strong, title, pillf = cfont(14, f["strong"]), cfont(21, f["display"]), cfont(12, f["strong"])
+        under = cfont(12, underline=True)
+        self._fonts = (body, small, strong, title, pillf, under)
+
+        try:
+            self._icon = _png_photo(tk, make_icon_image("idle", 64))
+            root.iconphoto(True, self._icon)
+            root._iconbitmap_method_called = True   # else CTk puts its own icon back on Windows
+        except Exception:
+            pass
+        mark = make_icon_image("idle", 80)
+        self._mark = ctk.CTkImage(light_image=mark, dark_image=mark, size=(38, 38))
+
+        entry_kw = dict(fg_color=P["raised"], border_color=P["outline"], border_width=1,
+                        text_color=P["ink"], corner_radius=8, height=34, font=body)
+        ghost_kw = dict(fg_color="transparent", border_width=1, border_color=P["outline"],
+                        text_color=P["ink"], hover_color=P["raised"], corner_radius=8,
+                        height=34, font=body)
+        switch_kw = dict(progress_color=P["violet"], fg_color=P["outline"],
+                         button_color=P["ink"], button_hover_color="#FFFFFF",
+                         text_color=P["ink"], text_color_disabled=P["outline"], font=body,
+                         onvalue=True, offvalue=False, switch_width=40, switch_height=22)
+        PAD = 18
+
+        outer = ctk.CTkFrame(root, fg_color=P["night"], corner_radius=0)
+        outer.grid(row=0, column=0, sticky="nsew")
+        outer.grid_columnconfigure((0, 1), weight=1, uniform="col")
+
+        head = ctk.CTkFrame(outer, fg_color="transparent")
+        head.grid(row=0, column=0, columnspan=2, sticky="ew", padx=26, pady=(18, 12))
+        head.grid_columnconfigure(2, weight=1)
+        ctk.CTkLabel(head, image=self._mark, text="").grid(row=0, column=0, rowspan=2,
+                                                           padx=(0, 12))
+        ctk.CTkLabel(head, text="Orpheus", font=title, text_color=P["ink"],
+                     height=26).grid(row=0, column=1, sticky="sw")
+        ctk.CTkLabel(head, text="Dictation settings", font=small, text_color=P["muted"],
+                     height=18).grid(row=1, column=1, sticky="nw")
+        self.pill = ctk.CTkLabel(head, text="", font=pillf, corner_radius=14, height=28)
+        self.pill.grid(row=0, column=2, rowspan=2, sticky="e")
+        row = 1
+        if problem:
+            ctk.CTkLabel(outer, text=problem, font=small, text_color=P["error"],
+                         wraplength=860, justify="left").grid(row=row, column=0, columnspan=2,
+                                                              sticky="w", padx=26, pady=(0, 8))
+            row += 1
+
+        left = ctk.CTkFrame(outer, fg_color="transparent")
+        left.grid(row=row, column=0, sticky="nsew", padx=(26, 7))
+        right = ctk.CTkFrame(outer, fg_color="transparent")
+        right.grid(row=row, column=1, sticky="nsew", padx=(7, 26))
+        outer.grid_rowconfigure(row, weight=1)
+
+        def card(parent, title, first=False, grow=False):
+            box = ctk.CTkFrame(parent, fg_color=P["card"], corner_radius=16, border_width=1,
+                               border_color=P["outline"])
+            box.pack(fill="both" if grow else "x", expand=grow, pady=(0 if first else 14, 0))
+            box.grid_columnconfigure((0, 1), weight=1, uniform="field")
+            ctk.CTkLabel(box, text=title, font=strong, text_color=P["violet"],
+                         height=20).grid(row=0, column=0, columnspan=2, sticky="w",
+                                         padx=PAD, pady=(14, 8))
+            return box
+
+        def label(parent, text, r, col=0, span=2, padx=(PAD, PAD)):
+            ctk.CTkLabel(parent, text=text, font=body, text_color=P["ink"], height=20).grid(
+                row=r, column=col, columnspan=span, sticky="w", padx=padx)
+
+        def hint(parent, text, r, pad=(2, 0)):
+            ctk.CTkLabel(parent, text=text, font=small, text_color=P["muted"], height=16,
+                         wraplength=400, justify="left").grid(row=r, column=0, columnspan=2,
+                                                              sticky="w", padx=PAD, pady=pad)
+
+        def switch(parent, text, var, r, pad=(0, 0), indent=0):
+            w = ctk.CTkSwitch(parent, text=text, variable=var, **switch_kw)
+            w.grid(row=r, column=0, columnspan=2, sticky="w", padx=(PAD + indent, PAD), pady=pad)
+            return w
+
+        # --- server
+        srv = card(left, "Server", first=True)
+        label(srv, "Server URL", 1)
+        self.url_entry = ctk.CTkEntry(srv, textvariable=v["url"], **entry_kw)
+        self.url_entry.grid(row=2, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(4, 10))
+        key_head = ctk.CTkFrame(srv, fg_color="transparent")
+        key_head.grid(row=3, column=0, sticky="ew", padx=(PAD, 6))
+        key_head.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(key_head, text="API key", font=body, text_color=P["ink"],
+                     height=20).grid(row=0, column=0, sticky="w")
+        ctk.CTkSwitch(key_head, text="Show", variable=v["show_key"],
+                      **dict(switch_kw, font=small)).grid(
+            row=0, column=1, sticky="e")
+        label(srv, "Model", 3, col=1, span=1, padx=(6, PAD))
+        self.key_entry = ctk.CTkEntry(srv, textvariable=v["api_key"], show="*", width=60,
+                                      **entry_kw)
+        self.key_entry.grid(row=4, column=0, sticky="ew", padx=(PAD, 6), pady=(4, 0))
+        ctk.CTkEntry(srv, textvariable=v["model"], width=60, **entry_kw).grid(
+            row=4, column=1, sticky="ew", padx=(6, PAD), pady=(4, 0))
+        hint(srv, SERVER_HINT, 5, pad=(6, 12))
+        test_row = ctk.CTkFrame(srv, fg_color="transparent")
+        test_row.grid(row=6, column=0, columnspan=2, sticky="ew", padx=PAD, pady=(0, 16))
+        test_row.grid_columnconfigure(1, weight=1)
+        self.test_btn = ctk.CTkButton(test_row, text="Test connection", width=140,
+                                      command=self.test, **ghost_kw)
+        self.test_btn.grid(row=0, column=0, sticky="w")
+        self.test_msg = ctk.CTkLabel(test_row, text="", font=small, text_color=P["muted"],
+                                     wraplength=230, justify="left")
+        self.test_msg.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        # --- hotkey
+        hk = card(left, "Dictation", grow=True)
+        hk.grid_columnconfigure((0, 1), weight=0, uniform="")
+        hk.grid_columnconfigure(2, weight=1)
+        ctk.CTkEntry(hk, textvariable=v["hotkey"], width=190, **entry_kw).grid(
+            row=1, column=0, sticky="w", padx=(PAD, 0))
+        self.record_btn = ctk.CTkButton(hk, text="Record", width=84, command=self.toggle_capture,
+                                        **ghost_kw)
+        self.record_btn.grid(row=1, column=1, sticky="w", padx=(8, 0))
+        self.hk_friendly = ctk.CTkLabel(hk, text="", font=strong, text_color=P["ink"], width=130,
+                                        anchor="w")
+        self.hk_friendly.grid(row=1, column=2, sticky="w", padx=(12, PAD))
+        self.hk_hint = ctk.CTkLabel(hk, text=self.HOTKEY_HINT, font=small, text_color=P["muted"],
+                                    wraplength=400, justify="left", height=16)
+        self.hk_hint.grid(row=2, column=0, columnspan=3, sticky="w", padx=PAD, pady=(6, 10))
+        for r, (text, var, pad, indent) in enumerate((
+                ("Hold the hotkey to talk, let go to stop", v["hold_to_talk"], (0, 0), 0),
+                ("Paste into the window you're typing in", v["paste"], (10, 0), 0),
+                ("Put the clipboard back afterwards", v["restore_clipboard"], (10, 16), 28)),
+                start=3):
+            w = ctk.CTkSwitch(hk, text=text, variable=var, **switch_kw)
+            w.grid(row=r, column=0, columnspan=3, sticky="nw", padx=(PAD + indent, PAD), pady=pad)
+        self.restore_cb = w
+        hk.grid_rowconfigure(5, weight=1)
+        # keys during Record go to a plain 1x1 frame: no bindings of its own
+        self.key_sink = tk.Frame(root, width=1, height=1, bg=P["night"], highlightthickness=0)
+        self.key_sink.place(x=0, y=0)
+
+        # --- text
+        tx = card(right, "Text", first=True, grow=True)
+        switch(tx, "Clean up with the server's AI pass", v["cleanup"], 1)
+        hint(tx, "Fillers out, punctuation in.", 2, pad=(2, 10))
+        style_row = ctk.CTkFrame(tx, fg_color="transparent")
+        style_row.grid(row=3, column=0, columnspan=2, sticky="w", padx=PAD, pady=(0, 10))
+        ctk.CTkLabel(style_row, text="Style", font=body, text_color=P["ink"]).grid(
+            row=0, column=0, padx=(0, 12))
+        ctk.CTkOptionMenu(style_row, variable=v["style"], values=[lb for lb, _ in self.STYLES],
+                          width=180, height=34, corner_radius=8, font=body, dropdown_font=body,
+                          fg_color=P["raised"], button_color=P["raised"],
+                          button_hover_color=P["outline"], text_color=P["ink"],
+                          dropdown_fg_color=P["card"], dropdown_hover_color=P["outline"],
+                          dropdown_text_color=P["ink"]).grid(row=0, column=1)
+        self.keep_cb = switch(tx, "Keep the period on a one-sentence chat message",
+                              v["keep_period"], 4, pad=(0, 12))
+        label(tx, "Personal dictionary", 5)
+        tx.grid_rowconfigure(6, weight=1)
+        self.dict_text = ctk.CTkTextbox(tx, height=84, font=body, fg_color=P["raised"],
+                                        border_color=P["outline"], border_width=1,
+                                        corner_radius=8, text_color=P["ink"], wrap="none",
+                                        scrollbar_button_color=P["outline"])
+        self.dict_text.grid(row=6, column=0, columnspan=2, sticky="nsew", padx=PAD, pady=(4, 4))
+        self.dict_text.insert("1.0", "\n".join(dictionary_entries(self.cfg["dictionary"])))
+        hint(tx, self.DICT_HINT, 7, pad=(2, 16))
+
+        # --- general
+        gen = card(right, "General")
+        switch(gen, "Beep when recording starts and stops", v["sounds"], 1)
+        switch(gen, "Start with Windows" if IS_WIN else "Start at login", v["autostart"], 2,
+               pad=(10, 16))
+
+        # --- bottom bar
+        bar = ctk.CTkFrame(outer, fg_color="transparent")
+        bar.grid(row=row + 1, column=0, columnspan=2, sticky="ew", padx=26, pady=(16, 18))
+        bar.grid_columnconfigure(1, weight=1)
+        link = ctk.CTkLabel(bar, text="Open config file", font=small, text_color=P["violet"],
+                            cursor="hand2", height=20)
+        link.grid(row=0, column=0, sticky="w")
+        link.bind("<Button-1>", lambda e: self.open_file())
+        link.bind("<Enter>", lambda e: link.configure(font=under))
+        link.bind("<Leave>", lambda e: link.configure(font=small))
+        self.save_msg = ctk.CTkLabel(bar, text="", font=small, text_color=P["error"],
+                                     wraplength=420)
+        self.save_msg.grid(row=0, column=1, sticky="e", padx=12)
+        ctk.CTkButton(bar, text="Cancel", width=96, command=self.close,
+                      **dict(ghost_kw, border_width=0)).grid(row=0, column=2, padx=(0, 8))
+        ctk.CTkButton(bar, text="Save", width=110, height=36, corner_radius=10,
+                      fg_color=P["violet"], hover_color=P["violet_deep"],
+                      text_color=P["night"], font=strong,
+                      command=self.save).grid(row=0, column=3)
+
+    def set_enabled(self, widget, on: bool) -> None:
+        widget.configure(state="normal" if on else "disabled")
+
+    def show_test(self, state: str, msg: str) -> None:
+        P = _ORPHEUS
+        fg = {"ok": P["mint"], "bad": P["error"], "testing": P["amber"]}.get(state, P["muted"])
+        bg = P["raised"] if state == "idle" else _tint(fg, P["night"], 0.16)
+        self.pill.configure(text=f"   ●  {pill_label(state, msg)}   ", fg_color=bg,
+                            text_color=fg)
+        self.test_msg.configure(text=test_detail(state, msg),
+                                text_color=fg if state in ("ok", "bad") else P["muted"])
+
+    def show_error(self, msg: str) -> None:
+        self.save_msg.configure(text=msg)
 
 
 def start_daemon(path: Path) -> None:

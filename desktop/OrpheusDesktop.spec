@@ -53,17 +53,25 @@ if sys.platform == "win32":
     with open(version_file, "w", encoding="utf-8") as f:
         f.write(VERSION_INFO.format(nums=nums, version=VERSION))
 
+# The Settings window's look (customtkinter) ships fonts, theme JSON and an
+# icon next to its Python code; collect them explicitly (pyinstaller-hooks-
+# contrib has a hook for it too).
+from PyInstaller.utils.hooks import collect_data_files
+theme_datas = collect_data_files("customtkinter")
+
 a = Analysis(
     [os.path.join(SPECPATH, "orpheus_desktop.py")],
     pathex=[SPECPATH],
     binaries=[],
-    datas=[],
+    datas=theme_datas,
     hiddenimports=[
         "pystray._win32",
         "PIL.Image", "PIL.ImageDraw",
         "pynput.keyboard._win32", "pynput.mouse._win32",
         "winsound", "winreg",
         "tkinter", "tkinter.ttk",      # the Settings window
+        "customtkinter",               # its look
+        "PIL.ImageTk", "PIL._tkinter_finder",   # CTkImage draws through ImageTk
     ],
     hookspath=[],
     runtime_hooks=[],

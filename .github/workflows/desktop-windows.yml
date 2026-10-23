@@ -118,7 +118,9 @@ jobs:
           Get-Content $log
           if (-not (Select-String -Path $log -Pattern "orpheus desktop $ver" -Quiet)) { throw "version line missing from $log" }
           if (-not (Select-String -Path $log -Pattern 'daemon not running' -Quiet)) { throw "status line missing from $log" }
-          if (-not (Select-String -Path $log -Pattern 'settings window ok' -Quiet)) { throw "the Settings window did not build (tkinter missing?)" }
+          if (-not (Select-String -Path $log -Pattern 'settings window ok \(OrpheusSettings' -Quiet)) {
+            throw "the Settings window did not open in the Orpheus look (tkinter or customtkinter missing from the build?)"
+          }
           $v = (Get-Item $exe).VersionInfo
           "ProductName=$($v.ProductName) ProductVersion=$($v.ProductVersion)"
           if ($v.ProductName -ne 'Orpheus' -or $v.ProductVersion -ne $ver) { throw "exe version resource wrong" }

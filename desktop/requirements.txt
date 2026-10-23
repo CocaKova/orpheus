@@ -4,3 +4,8 @@ sounddevice>=0.4.6   # needs portaudio; on Linux without it the client falls bac
 pynput>=1.7.6        # global hotkey + Ctrl+V on Windows/X11 (not used on Wayland)
 pystray>=0.19        # tray icon (optional: without it the daemon runs headless)
 Pillow>=10.0         # draws the tray icon (optional, with pystray)
+# The Settings window's Orpheus look. Without customtkinter the window falls
+# back to plain ttk.
+customtkinter==6.0.0  # rounded cards and switches (MIT)
+darkdetect==0.8.0     # customtkinter needs it (BSD-3-Clause)
+packaging==26.3       # customtkinter needs it (Apache-2.0 OR BSD-2-Clause)
