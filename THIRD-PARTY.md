@@ -10,7 +10,6 @@ from source installs the Python packages from [`desktop/requirements.txt`](deskt
 | [Tcl/Tk](https://www.tcl-lang.org) 8.6, through tkinter | draws the Settings window | Tcl/Tk license (BSD-style) |
 | [PyInstaller](https://pyinstaller.org) bootloader | starts the app | GPL-2.0-or-later with the bootloader exception |
 | [requests](https://github.com/psf/requests), urllib3, idna, charset-normalizer, certifi | talks to the transcription server | Apache-2.0; MIT; BSD-3-Clause; MIT; MPL-2.0 |
-| [numpy](https://numpy.org) | measures the take's level for the silence check | BSD-3-Clause AND 0BSD AND MIT AND Zlib AND CC0-1.0 |
 | [sounddevice](https://github.com/spatialaudio/python-sounddevice), cffi, pycparser, [PortAudio](https://www.portaudio.com) | records from the microphone | MIT; MIT-0; BSD-3-Clause; PortAudio license (MIT-style) |
 | [pynput](https://github.com/moses-palmer/pynput), six | the global hotkey and the Ctrl+V paste | LGPL-3.0; MIT |
 | [pystray](https://github.com/moses-palmer/pystray) | the tray icon and its notifications | LGPL-3.0 |

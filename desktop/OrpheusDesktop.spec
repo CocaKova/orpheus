@@ -75,7 +75,9 @@ a = Analysis(
     ],
     hookspath=[],
     runtime_hooks=[],
-    excludes=["matplotlib", "scipy"],
+    # numpy: the client doesn't use it, but Pillow and sounddevice have optional
+    # numpy imports that PyInstaller follows whenever numpy is installed.
+    excludes=["numpy", "matplotlib", "scipy"],
     noarchive=False,
 )
 pyz = PYZ(a.pure)

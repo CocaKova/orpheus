@@ -16,7 +16,7 @@ The take is recorded at 16 kHz mono, sent to the Orpheus server, and the text
 is pasted into whatever has focus. Nothing is stored except a failed take,
 which is saved so it is never lost.
 
-Required:  requests, numpy, sounddevice, pynput   (see requirements.txt)
+Required:  requests, sounddevice, pynput   (see requirements.txt)
 Optional:  pystray + Pillow (tray icon; headless daemon without them),
            tkinter (the Settings window; without it, edit the config file),
            arecord (Linux mic fallback when portaudio is missing),
@@ -26,6 +26,7 @@ Optional:  pystray + Pillow (tray icon; headless daemon without them),
 from __future__ import annotations
 
 import argparse
+import array
 import io
 import json
 import os
@@ -258,17 +259,19 @@ def wav_bytes(pcm: bytes, rate: int = RATE) -> bytes:
 
 
 def pcm_stats(pcm: bytes) -> tuple[float, int]:
-    """(peak amplitude 0..1, sample count) for int16 PCM."""
+    """(peak amplitude 0..1, sample count) for little-endian int16 PCM.
+    The standard library's array does this at C speed, so the client needs no
+    numpy (part of numpy's license set isn't OSI-approved, and it was a big
+    share of the Windows build)."""
     n = len(pcm) // 2
     if n == 0:
         return 0.0, 0
-    try:
-        import numpy as np
-        arr = np.frombuffer(pcm[: n * 2], dtype=np.int16)
-        return float(np.abs(arr.astype(np.int32)).max()) / 32768.0, n
-    except ImportError:
-        peak = max(abs(s) for s in struct.unpack(f"<{n}h", pcm[: n * 2]))
-        return peak / 32768.0, n
+    samples = array.array("h")
+    samples.frombytes(pcm[: n * 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    # -32768 has no positive int16 twin; as Python ints it is simply 32768
+    return max(max(samples), -min(samples)) / 32768.0, n
 
 
 def is_silence(pcm: bytes, rate: int = RATE) -> bool:

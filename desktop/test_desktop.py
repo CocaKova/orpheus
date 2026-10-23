@@ -65,6 +65,35 @@ eq((f["trailing_period"], f["style"]), ("keep", "message"))
 f = od.SttClient.from_config(dict(od.DEFAULTS, raw=True, dictionary="a, b")).form_fields()
 eq((f["clean"], f["prompt"]), ("false", "a, b"))
 
+# --- level math: peak and silence, exact values (this replaced numpy; same results)
+def pcm(*samples):
+    return struct.pack(f"<{len(samples)}h", *samples)
+
+
+eq(od.pcm_stats(b""), (0.0, 0))
+eq(od.pcm_stats(b"\x01"), (0.0, 0))                          # half a sample is no sample
+eq(od.pcm_stats(pcm(0, 0, 0)), (0.0, 3))
+eq(od.pcm_stats(pcm(100, -200, 50)), (200 / 32768, 3))
+eq(od.pcm_stats(pcm(-32768)), (1.0, 1))                       # int16's minimum, no overflow
+eq(od.pcm_stats(pcm(32767, -1)), (32767 / 32768, 2))
+eq(od.pcm_stats(pcm(16) + b"\x7f"), (16 / 32768, 1))          # trailing odd byte ignored
+eq(od.pcm_stats(b"\x00\x80\xff\x7f"), (1.0, 2))              # little-endian -32768, 32767
+quiet, loud = 393, 394                                        # 0.012 * 32768 = 393.2
+eq(od.is_silence(pcm(*[quiet] * 16000)), True)
+eq(od.is_silence(pcm(*[loud] * 16000)), False)
+eq(od.is_silence(pcm(*[loud] * 4799)), True)                  # under 0.3 s at 16 kHz
+eq(od.is_silence(pcm(*[loud] * 4800)), False)
+eq(od.is_silence(pcm(*[-loud] * 8000), rate=16000), False)    # the sign doesn't matter
+try:                                                          # and the old numpy formula agrees
+    import numpy as np
+    import random
+    rnd = random.Random(7)
+    raw = pcm(*[rnd.randint(-32768, 32767) for _ in range(50000)], -32768)
+    old = float(np.abs(np.frombuffer(raw, dtype=np.int16).astype(np.int32)).max()) / 32768.0
+    eq(od.pcm_stats(raw), (old, 50001))
+except ImportError:
+    pass
+
 # --- dictionary: the window shows one per line and saves commas (every server version reads those)
 eq(od.dictionary_entries("Kubernetes\npie torch=PyTorch;  gRPC ,,\n\n"),
    ["Kubernetes", "pie torch=PyTorch", "gRPC"])
