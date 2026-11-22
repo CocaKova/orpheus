@@ -59,7 +59,7 @@ import timestamps
 from fastapi import FastAPI, Form, Header, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 
 MODEL_NAME = os.environ.get("ORPHEUS_MODEL", "nvidia/parakeet-tdt-0.6b-v2")
 CLEAN_DEFAULT = os.environ.get("ORPHEUS_CLEAN_DEFAULT", "true").lower() == "true"
@@ -143,6 +143,28 @@ def wav_seconds(wav_path: str) -> float:
         return w.getnframes() / float(w.getframerate())
 
 
+# Tried in order; a 400 moves to the next (a template may reject a kwarg it validates).
+THINK_OFF_KWARGS = (
+    {"enable_thinking": False, "reasoning_effort": "no_think"},
+    {"enable_thinking": False},
+    None,  # some backends (e.g. Mistral tokenizer mode) reject chat_template_kwargs
+)
+
+
+async def post_without_thinking(body: dict) -> httpx.Response:
+    # Not cached: the brain behind CLEAN_URL can be swapped at any time, and a
+    # 400 costs a few ms.
+    for kw in THINK_OFF_KWARGS:
+        if kw is None:
+            body.pop("chat_template_kwargs", None)
+        else:
+            body["chat_template_kwargs"] = dict(kw)
+        r = await http_client.post(f"{CLEAN_URL}/chat/completions", json=body, timeout=30.0)
+        if r.status_code != 400:
+            return r
+    return r
+
+
 async def cleanup_pass(text: str, hints: str = "") -> tuple[str, str]:
     """Polish pre-passed dictation via the local LLM.
 
@@ -163,19 +185,26 @@ async def cleanup_pass(text: str, hints: str = "") -> tuple[str, str]:
             ],
             "temperature": CLEAN_TEMP,
             "max_tokens": max(256, len(text)),
-            "chat_template_kwargs": {"enable_thinking": False},
+            # Thinking off, in every spelling we know: Qwen/GLM read enable_thinking,
+            # Hy4 reads reasoning_effort=no_think (and ignores enable_thinking).
+            "chat_template_kwargs": dict(THINK_OFF_KWARGS[0]),
         }
         for attempt in (1, 2):
-            r = await http_client.post(f"{CLEAN_URL}/chat/completions", json=body, timeout=30.0)
-            if r.status_code == 400:
-                # some backends (e.g. Mistral tokenizer mode) reject chat_template_kwargs
-                body.pop("chat_template_kwargs", None)
-                r = await http_client.post(f"{CLEAN_URL}/chat/completions", json=body, timeout=30.0)
+            r = await post_without_thinking(body)
             r.raise_for_status()
-            msg = r.json()["choices"][0]["message"]
-            # some reasoning parsers route no-think output into the
-            # reasoning field and leave content empty
-            cleaned = (msg.get("content") or msg.get("reasoning") or "").strip()
+            choice = r.json()["choices"][0]
+            msg = choice["message"]
+            content = (msg.get("content") or "").strip()
+            # Some reasoning parsers route no-think output into the reasoning
+            # field and leave content empty. Only trust that when the model
+            # finished normally and the "reasoning" is answer-sized: a model that
+            # thought anyway hits max_tokens and its reasoning is notes ABOUT the
+            # dictation, which must never be pasted (11-22 Hy4 incident).
+            reasoning = (msg.get("reasoning") or msg.get("reasoning_content") or "").strip()
+            if not content and reasoning and choice.get("finish_reason") == "stop" \
+                    and len(reasoning.split()) <= len(text.split()) * 1.5 + 10:
+                content = reasoning
+            cleaned = content
             if not cleaned:
                 note = "empty answer"
                 continue
