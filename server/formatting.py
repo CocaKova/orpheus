@@ -1,5 +1,5 @@
-"""Dictation formatting: spoken-symbol pre-pass, cleanup prompt, and the
-content-preservation guard that keeps the LLM honest.
+"""Dictation formatting: spoken-symbol pre-pass, self-correction, cleanup
+prompt, and the content-preservation guard that keeps the LLM honest.
 
 Pipeline:  ASR text -> prepass() -> LLM cleanup -> guard() -> restore_terminal()
            -> listify() -> fit_context() -> final text
@@ -7,7 +7,14 @@ Pipeline:  ASR text -> prepass() -> LLM cleanup -> guard() -> restore_terminal()
 The pre-pass is deterministic and only rewrites tokens that are unambiguous
 when spoken ("new line", "open paren", "exclamation point"). Words that are
 also ordinary English ("at", "dot", "dash", "hash", "period" mid-sentence)
-are left for the LLM, which sees the surrounding sentence.
+are left for the LLM, which sees the surrounding sentence. It also resolves
+spoken self-corrections ("Tuesday, oh wait no, Wednesday", "milk, no, oat
+milk", "never mind that last part") so the text is right without the LLM,
+but only on a clean parallel swap: losing the speaker's words is worse than
+leaving a correction unresolved, so ambiguous cues are left as spoken.
+Several corrections in one sentence each reach back over their own clause,
+so the text between them survives. Cue words that are ordinary speech
+("No, I don't think so", "wait for me", "I mean it") are left alone.
 
 Lists get three layers: spoken markers ("bullet point", "number one") are
 rewritten here; the LLM is asked to lay out anything the speaker enumerates
@@ -77,29 +84,729 @@ _RULES = [
 ]
 _COMPILED = [(re.compile(p, _I), r) for p, r in _RULES]
 
-# "pick up the cleaning, scratch that, the cleaners are closed" -> the thought
-# before the trigger goes, what follows stays. Retracts back to the previous
-# sentence end; when the trigger opens a sentence, the previous sentence is
-# the thought being retracted.
-_SCRATCH = re.compile(r"\b(?:scratch that|strike that|delete that)\b[,.]?\s*", _I)
-_SENTENCE_END = re.compile(r"[.!?\n]")
+# ------------------------------------------------------- self-correction
+#
+# "Tuesday, oh wait no, Wednesday", "milk, no, oat milk", "never mind that
+# last part": the thought before the cue goes, what follows stays. The cue
+# words are ordinary English too ("No, I don't think so", "wait for me", "I
+# mean it"), so a cue only fires on a clean parallel swap: the replacement
+# repeats the clause opening, reuses the same anchor, swaps a value of the
+# same shape, or shares a tail whose changed slot is right before it. A pause
+# or a hook word alone is not enough ("Red paint, no, blue", "five dollars,
+# no more, no less"), and a phrase rewrite ("on the table, no, under the
+# table") is left for the LLM. Losing the speaker's words is worse than
+# leaving a correction unresolved. This runs in prepass, before the LLM: the
+# correction has to be right when the cleanup model is down, and the content
+# guard must compare the model's answer against the corrected text rather
+# than the retracted one.
+#
+# Two families of cue:
+#   hard     scratch that / never mind that last part / let me rephrase that:
+#            drop the thought before the cue; bare "never mind" only does so
+#            with an explicit object
+#   replace  no / wait / actually / sorry / I mean / make that: drop just the
+#            piece of the thought the replacement supersedes
+# A replacement is spliced at the smallest natural boundary: at a shared
+# preposition or determiner ("to John, no, to Mary"), around a shared noun
+# or verb ("eggs and milk, no, oat milk"), at the date or number being
+# changed ("meet Tuesday at 3, no, Wednesday at 4"), or the last word.
+#
+# A cue reaches back over its own clause only, and its evidence and cut are
+# measured against the replacement phrase (up to the next cue, pause or
+# sentence end), never the rest of the dictation. That is what keeps several
+# corrections in one sentence from collapsing: "grab the mail at two, no,
+# three, and get lunch from the taco place, I mean the burger place" ->
+# "grab the mail at three, and get lunch from the burger place", with the
+# first correction still resolved. A swap that would delete a word the
+# replacement does not carry ("Order two pizzas, no, three" -> "Order three")
+# is left as spoken for the model.
+#
+# The guard forgives what a leftover cue licenses - the cue words and the span
+# they replace - so a correct repair is not read as content loss; words
+# outside those spans are still required.
+_SENTENCE_END = re.compile(r"[.!?…](?=\s|$)")
+_CLAUSE_SEP = re.compile(r"[,;:—–](?=\s|$)")
+_WORD_RX = re.compile(r"[A-Za-z0-9]+(?:[-'’.:/][A-Za-z0-9]+)*")
+
+_CUE = re.compile(
+    r"\b(?P<cue>"
+    r"never\s*mind(?:\s+(?:that\s+)?(?:last\s+part|everything|that|this|it))?"
+    r"|forget\s+(?:it|that|everything|about\s+it)"
+    r"|disregard\s+(?:that|it|this)"
+    r"|(?:scratch|strike|delete|ignore|cancel)\s+(?:that|it|this)"
+    r"|(?:oh\s+)?(?:wait|hold\s+on)(?:\s+(?:a\s+(?:second|minute|moment)|one\s+second))?\b"
+    r"|i\s+mean\b"
+    r"|or\s+rather\b"
+    r"|(?:make|change)\s+(?:that|it)\b"
+    r"|on\s+second\s+thought\b"
+    r"|let\s+me\s+rephrase(?:\s+(?:that|it|this))?\b"
+    r"|correction\b"
+    r"|actually\b"
+    r"|sorry\b"
+    r"|rather\b"
+    r"|no\b)"
+    r"(?P<chain>(?:\s*[,;:]?\s*(?:oh\s+)?(?:wait|no|actually|sorry|i\s+mean"
+    r"|(?:make|change)\s+(?:that|it)|or\s+rather)\b)*)"
+    r"\s*(?P<pause>[,;:.!?…—–-])?\s*", _I)
+
+# Bare "never mind" is mostly discourse ("Thanks, never mind, I found it";
+# "Never mind the weather"). It retracts only with an explicit object that
+# points back at the text ("never mind that last part"). The verb + object
+# forms ("scratch that itch", "delete that file") are qualified further in
+# _cue_kind: no pause and a bare noun after the cue means ordinary speech.
+_HARD_ALWAYS = re.compile(
+    r"\bnever\s*mind\s+(?:that\s+)?last\s+part\b"
+    r"|\bnever\s*mind\s+everything\b", _I)
+_HARD_OBJECT = re.compile(
+    r"\bforget\s+(?:that|everything|about\s+it)\b"
+    r"|\bdisregard\s+(?:that|it|this)\b"
+    r"|\blet\s+me\s+rephrase\s+(?:that|it|this)\b"
+    r"|\b(?:scratch|strike|delete|ignore|cancel)\s+(?:that|it|this)\b", _I)
+_STRONG = re.compile(r"\b(?:make|change)\s+(?:that|it)\b|\bor\s+rather\b"
+                     r"|\bcorrection\b|\bon\s+second\s+thought\b", _I)
+
+_PREP = frozenset("at in on to for with from by of into under over as "
+                  "before after around until since during".split())
+_DET = frozenset("a an the this that these those my your our their his her its".split())
+_POSS = _DET | frozenset(("whose",))
+_CONJ = frozenset(("and", "or", "but", "so", "then", "plus", "also"))
+_ANCHORS = _PREP | _DET
+_FUNCTION = _PREP | _DET | _CONJ | frozenset("i we you it he she they not do cannot dont".split())
+_KEEP_BEFORE = _ANCHORS | _CONJ | frozenset(
+    "like want need have has had love hate prefer use buy get take call send meet "
+    "book order is are was were be been do does did can will would should could "
+    "make made think said say tell ask give put keep".split())
+_TIME_LINK = frozenset(
+    "at on in by for from until before after around this next coming early late "
+    "up about to of the a an".split())
+_DAYS = frozenset(
+    "monday mon tuesday tue tues wednesday wed thursday thu thurs friday fri "
+    "saturday sat sunday sun today tomorrow tonight yesterday".split())
+_MONTHS = frozenset(
+    "january jan february feb march mar april apr may june jun july jul august aug "
+    "september sep sept october oct november nov december dec".split())
+_NUMBER_WORDS = frozenset(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen "
+    "fourteen fifteen sixteen seventeen eighteen nineteen twenty thirty forty fifty "
+    "sixty seventy eighty ninety hundred thousand million billion "
+    "first second third fourth fifth sixth seventh eighth ninth tenth "
+    "eleventh twelfth thirteenth fourteenth fifteenth sixteenth seventeenth "
+    "eighteenth nineteenth twentieth thirtieth".split())
+_TIME_OF_DAY = frozenset("morning afternoon evening night noon midnight".split())
+_BLOCK = {
+    "wait": frozenset(
+        "for at on in until to a an the up with and just here there i we you it "
+        "he she they what who how this that then not problem rush minute".split()),
+    "no": frozenset(
+        "one way problem idea thanks comment doubt time matter kidding but so like "
+        "i we you it they he she there this that and or sir ma am offense worries "
+        "luck chance need reason excuse point question answer sense choice "
+        "thank thanks please then not never just because when before after while "
+        "unless yet still eventually twice once again either neither later soon "
+        "now maybe perhaps probably definitely certainly honestly frankly "
+        "seriously uh um er erm hmm".split()),
+    "mean": frozenset("it you that what well business by exactly really this".split()),
+    "sorry": frozenset("for about to that i if but what again excuse this "
+                       "sometimes so just then when because".split()),
+}
+# a retraction cue before a fresh clause retracts; before a bare noun it is
+# usually a verb and object ("scratch that itch").
+_CLAUSE_START = _FUNCTION | frozenset(
+    "please just and but so then also now okay ok alright let lets why how "
+    "what where when who which if because".split())
 
 
-def _retract(text: str) -> str:
+def _starts_clause(text: str) -> bool:
+    """Does `text` open a fresh clause? A retraction cue before a new clause
+    retracts; the same cue before a bare noun is usually a verb and object
+    ("scratch that itch")."""
+    s = text.lstrip(" \t\"'(")
+    if not s:
+        return False
+    if s[0].isupper():
+        return True
+    return _first_word(s) in _CLAUSE_START
+
+
+def _first_word(text: str) -> str:
+    m = _WORD_RX.search(text)
+    return m.group(0).lower() if m else ""
+
+
+def _rest_has_content(rest: str) -> bool:
+    return bool(_WORD_RX.search(rest))
+
+
+def _cue_kind(cue: str, chain: str = "", rest: str = "",
+              post_pause: bool = False) -> str:
+    if _HARD_ALWAYS.search(cue):
+        return "hard"
+    if _HARD_OBJECT.search(cue):
+        # "Scratch that, the cleaners are closed" retracts; "scratch that
+        # itch" does not. A pause, an empty tail, or a clause after the cue
+        # is the evidence that the speaker meant the retraction.
+        if post_pause or not rest.strip() or _starts_clause(rest):
+            return "hard"
+        return "soft"
+    if _STRONG.search(cue) or chain.strip():
+        return "replace"
+    return "soft"
+
+
+def _blocked(cue: str, rest: str) -> bool:
+    low = cue.lower()
+    first = _first_word(rest)
+    if "'" in first:
+        first = first.split("'")[0]
+    if ("wait" in low or "hold on" in low) and first in _BLOCK["wait"]:
+        return True
+    if re.search(r"\bno\b", low) and first in _BLOCK["no"]:
+        return True
+    if re.search(r"\bi\s+mean\b", low) and first in _BLOCK["mean"]:
+        return True
+    if "sorry" in low and first in _BLOCK["sorry"]:
+        return True
+    return False
+
+
+def _region_bounds(out: str) -> tuple[int, int]:
+    """Span of the thought a cue can retract: the current clause mid-sentence,
+    or the sentence that just ended when the cue opens a new one.
+
+    A clause, not everything since the sentence began. With two corrections in
+    one sentence the second must reach back over its own span only: "Grab the
+    mail at two, no, three, and get lunch from the taco place, I mean the
+    burger place" has to keep "Grab the mail at three, and get lunch from".
+    The comma right before the cue is the cue's own pause (consumed by the
+    cue match), so the clause starts after the previous separator.
+    """
+    body = out.rstrip()
+    if not body:
+        return 0, 0
+    ends = [m.end() for m in _SENTENCE_END.finditer(body)]
+    if ends and ends[-1] == len(body):
+        start = ends[-2] if len(ends) > 1 else 0
+    else:
+        start = ends[-1] if ends else 0
+    clause = body[start:].rstrip(" ,;:—–-")
+    seps = list(_CLAUSE_SEP.finditer(clause))
+    if seps:
+        start += seps[-1].end()
+        # A clause that is only a hesitation ("noon, uh, scratch that") is not
+        # the thought being taken back; the one before it is.
+        if _HESITATION_ONLY.fullmatch(body[start:]):
+            inner, _ = _region_bounds(body[:start].rstrip(" ,;:—–-"))
+            return inner, len(body)
+    return start, len(body)
+
+
+_HESITATION_ONLY = re.compile(r"[\s,;:—–-]*(?:(?:um+|uh+|uhm|hmm+|mm+|er+|ah+)[\s,;:—–-]*)+", _I)
+
+
+def _clause_lead(region: str) -> tuple[int, str]:
+    """Start and word of the region's first non-conjunction token: the word a
+    restated clause has to repeat ("and get lunch from ..." -> "get")."""
+    words = list(_WORD_RX.finditer(region))
+    if not words:
+        return 0, ""
+    i = 0
+    while i < len(words) - 1 and words[i].group(0).lower() in _CONJ:
+        i += 1
+    return words[i].start(), words[i].group(0).lower()
+
+
+def _is_number_token(token: str) -> bool:
+    t = token.lower()
+    return t in _NUMBER_WORDS or any(c.isdigit() for c in t)
+
+
+def _value_category(first: str) -> str | None:
+    if not first:
+        return None
+    if first in _DAYS or first in _MONTHS:
+        return "day"
+    if _is_number_token(first):
+        return "number"
+    return None
+
+
+def _last_value(region: str, category: str):
+    best = None
+    for m in _WORD_RX.finditer(region):
+        t = m.group(0).lower()
+        if category == "day" and (t in _DAYS or t in _MONTHS):
+            best = m
+        elif category == "number" and _is_number_token(t):
+            best = m
+    return best
+
+
+def _expr_start(region: str, value_start: int) -> int:
+    """Walk left from a date/number to the start of the time phrase
+    ('at 3 on Tuesday' -> the 'at')."""
+    words = list(_WORD_RX.finditer(region))
+    idx = 0
+    for i, m in enumerate(words):
+        if m.start() >= value_start:
+            idx = i
+            break
+    while idx > 0:
+        prev = words[idx - 1].group(0).lower()
+        if prev in _TIME_LINK or _is_number_token(prev) \
+                or prev in _DAYS or prev in _MONTHS or prev in _TIME_OF_DAY:
+            idx -= 1
+        else:
+            break
+    return words[idx].start()
+
+
+def _number_run_start(region: str, value_start: int) -> int:
+    words = list(_WORD_RX.finditer(region))
+    idx = 0
+    for i, m in enumerate(words):
+        if m.start() >= value_start:
+            idx = i
+            break
+    while idx > 0 and _is_number_token(words[idx - 1].group(0)):
+        idx -= 1
+    return words[idx].start()
+
+
+def _rich_time_expr(region: str, value) -> bool:
+    has_day = any(m.group(0).lower() in _DAYS or m.group(0).lower() in _MONTHS
+                  for m in _WORD_RX.finditer(region))
+    has_number = any(_is_number_token(m.group(0)) for m in _WORD_RX.finditer(region))
+    return has_day and has_number
+
+
+def _shared_suffix_len(region: str, rest: str) -> int:
+    left = [m.group(0).lower() for m in _WORD_RX.finditer(region)]
+    right = [m.group(0).lower() for m in _WORD_RX.finditer(rest)]
+    n = 0
+    while n < len(left) and n < len(right) and left[-1 - n] == right[-1 - n]:
+        n += 1
+    return n
+
+
+def _rest_has_day(text: str) -> bool:
+    return any(m.group(0).lower() in _DAYS or m.group(0).lower() in _MONTHS
+               for m in _WORD_RX.finditer(text))
+
+
+def _last_chunk_start(text: str) -> int:
+    """Start of the last space-delimited item, ignoring trailing punctuation.
+    Keeps exotic tokens (emails, URLs, #codes, filenames) whole."""
+    stripped = text.rstrip(" \t,;:—–-.!?…")
+    if not stripped:
+        return 0
+    i = max(stripped.rfind(" "), stripped.rfind("\n"), stripped.rfind("\t"))
+    return 0 if i < 0 else i + 1
+
+
+def _with_lead(region: str, start: int) -> int:
+    """Include a leading # or @ that is glued to the token at `start`."""
+    while start > 0 and region[start - 1] in "#@":
+        start -= 1
+    return start
+
+
+def _keep_prep_end(region: str, idx: int) -> int:
+    """If the time phrase starts at a preposition and the replacement does not
+    bring its own, keep the preposition: 'at 3 on Tuesday, no, 4 on Wednesday'
+    -> 'at 4 on Wednesday'."""
+    m = _WORD_RX.match(region, idx)
+    if m and m.group(0).lower() in _TIME_LINK:
+        return m.end()
+    return idx
+
+
+def _has_number_before(region: str, idx: int) -> bool:
+    return any(_is_number_token(m.group(0))
+               for m in _WORD_RX.finditer(region) if m.start() < idx)
+
+
+def _nearest_anchor(region: str, anchor: str) -> int | None:
+    """Position of the occurrence of `anchor` closest to the cue."""
+    pos = None
+    for m in _WORD_RX.finditer(region):
+        if m.group(0).lower() == anchor:
+            pos = m.start()
+    return pos
+
+
+def _anchor_pos(region: str, rest: str, anchor: str) -> int | None:
+    """Where a replacement that repeats `anchor` attaches in `region`: the
+    occurrence whose tail has the same length as the replacement's tail,
+    nearest the cue.
+
+    "Book the one on the left, no, the one on the right" attaches at the
+    first "the" (the phrase restarts); "grab the mail at three, and get lunch
+    from the taco place, I mean the burger place" attaches at "the taco place"
+    (the nearest "the"), because that is the one whose tail matches. Choosing
+    a fixed occurrence made one of the two wrong.
+    """
+    rwords = list(_WORD_RX.finditer(rest))
+    if len(rwords) < 2 or rwords[0].group(0).lower() != anchor:
+        return None
+    lwords = list(_WORD_RX.finditer(region))
+    need = len(rwords) - 1
+    hits = [i for i, m in enumerate(lwords)
+            if m.group(0).lower() == anchor and len(lwords) - i - 1 == need]
+    return lwords[hits[-1]].start() if hits else None
+
+
+def _replace_cut(region: str, rest: str) -> int:
+    """Where, inside `region`, the thought the replacement supersedes starts."""
+    rest = _replacement(rest)
+    first = _first_word(rest)
+    # "call Sarah, no, call Mark" restarts the thought: drop the whole clause.
+    lead_start, lead = _clause_lead(region)
+    if first and first == lead and not _is_function_word(first):
+        return lead_start
+    # a replacement that keeps the same preposition/determiner replaces the
+    # phrase after it: "to John, no, to Mary" -> keep the first "to".
+    if first in _ANCHORS:
+        pos = _anchor_pos(region, rest, first)
+        if pos is None:
+            pos = _nearest_anchor(region, first)
+        if pos is not None:
+            return pos
+    # dates and numbers replace the whole value, or the whole time phrase
+    # when the replacement brings its own date.
+    category = _value_category(first)
+    if category:
+        value = _last_value(region, category)
+        if value:
+            if first in _PREP:
+                return _expr_start(region, value.start())
+            if category == "number" and _rest_has_day(rest):
+                return _keep_prep_end(region, _expr_start(region, value.start()))
+            if category == "day":
+                if _has_number_before(region, value.start()):
+                    return _with_lead(region, _expr_start(region, value.start()))
+                return _with_lead(region, value.start())
+            if category == "number":
+                return _with_lead(region, _number_run_start(region, value.start()))
+            return _with_lead(region, value.start())
+    # A replacement that shares a trailing word is replacing the head or the
+    # modifier around it: "eggs and milk, no, oat milk" keeps "and";
+    # "Monday morning, no, Tuesday morning" drops "Monday".
+    shared = _shared_suffix_len(region, rest)
+    if shared:
+        words = list(_WORD_RX.finditer(region))
+        p_idx = len(words) - shared
+        if p_idx > 0:
+            prev = words[p_idx - 1].group(0).lower()
+            r_extra = len(list(_WORD_RX.finditer(rest))) - shared
+            if prev in _CONJ or prev in _KEEP_BEFORE or r_extra < 1:
+                return words[p_idx].start()
+            return words[p_idx - 1].start()
+        return words[0].start()
+    # nothing structural to go on: the last item is the thing being fixed
+    return _last_chunk_start(region)
+
+
+def _day_month(token: str) -> bool:
+    t = token.lower()
+    return t in _DAYS or t in _MONTHS
+
+
+_CUE_WORDS = frozenset("no wait actually sorry mean i rather or".split())
+_VALUE_UNITS = frozenset(
+    "dollars dollar cents cent percent bucks oclock am pm hundred thousand "
+    "million billion the and".split())
+
+
+def _replacement(rest: str) -> str:
+    """The phrase a correction puts in place of the retracted one: the words
+    after the cue up to the next cue, pause or sentence end.
+
+    Evidence and cuts have to judge *this*, not the rest of the dictation.
+    "Send the invoice to John, no, to Mary, and cc Sarah, no, cc Dana" is a
+    clean one-word swap ("to John" -> "to Mary"); measured against the whole
+    tail it looked like a 1-vs-7 phrase and the first correction never fired.
+    """
+    m = _CUE.search(rest)
+    if m:
+        rest = rest[:m.start()]
+    m = _SENTENCE_END.search(rest)
+    if m:
+        rest = rest[:m.start()]
+    m = _CLAUSE_SEP.search(rest.rstrip(" .!?…"))
+    if m:
+        rest = rest[:m.start()]
+    return rest.strip()
+
+
+def _value_phrase(rest: str) -> bool:
+    """Does `rest` read as a replacement value, not a new predicate? A clean
+    swap is "4", "4 on Wednesday", "six dollars"; "4 people showed up" and
+    "six is fine" continue into a clause and are left to the LLM. The value
+    ends at the next cue, pause or sentence end: in "at two, no, three, and
+    get lunch..." the replacement is "three", and the clause that follows it
+    is the speaker carrying on, not part of the swap."""
+    rest = _replacement(rest)
+    words = [m.group(0).lower() for m in _WORD_RX.finditer(rest)]
+    if not words:
+        return False
+    for w in words[1:]:
+        if (w in _TIME_LINK or w in _DAYS or w in _MONTHS
+                or w in _TIME_OF_DAY or w in _NUMBER_WORDS
+                or w in _VALUE_UNITS or w in _CUE_WORDS
+                or _is_number_token(w)):
+            continue
+        return False
+    return True
+
+
+def _function_stem(word: str) -> str:
+    w = word.lower()
+    for sep in ("'", "’"):
+        if sep in w:
+            return w.split(sep)[0]
+    return w
+
+
+def _is_function_word(word: str) -> bool:
+    """'it's', 'that's', 'we're' are function words, not a repeated clause
+    opening: 'It's not bad, actually, it's quite good' is not a correction."""
+    return _function_stem(word) in _FUNCTION
+
+
+def _trailing_chunk(text: str) -> str:
+    """The last spoken item in `text`, punctuation and a glued #/@ removed."""
+    stripped = text.rstrip(" \t,;:.!?…—–-")
+    if not stripped:
+        return ""
+    i = max(stripped.rfind(" "), stripped.rfind("\n"), stripped.rfind("\t"))
+    start = 0 if i < 0 else i + 1
+    while start > 0 and stripped[start - 1] in "#@":
+        start -= 1
+    return stripped[start:]
+
+
+def _leading_chunk(text: str) -> str:
+    """The first spoken item in `text`, without leading/trailing punctuation."""
+    s = text.lstrip(" \t,;:—–-'\"([")
+    if not s:
+        return ""
+    chunk = re.match(r"\S+", s).group(0)
+    for junk in "\"'()]}":
+        chunk = chunk.rstrip(junk)
+    return chunk.rstrip(".!?,;:…—–-")
+
+
+def _same_shape(a: str, b: str) -> bool:
+    """Two tokens of the same spoken shape: a number swapped for a number,
+    a day for a day, an address for an address, a path for a path. This is
+    the cleanest deterministic swap and the one the speaker most often makes."""
+    if not a or not b:
+        return False
+    if _is_number_token(a) and _is_number_token(b):
+        return True
+    if _day_month(a) and _day_month(b):
+        return True
+    if "@" in a and "@" in b:
+        return True
+    path_a = "/" in a or "://" in a or ("." in a and not a.endswith("."))
+    path_b = "/" in b or "://" in b or ("." in b and not b.endswith("."))
+    return path_a and path_b
+
+
+def _anchor_swap(region: str, rest: str, anchor: str) -> bool:
+    """A preposition/determiner swap is parallel only when the phrase after
+    it has the same length on both sides: "to John, no, to Mary" (1 = 1) is a
+    clean swap; "at the store, no, the park was closed" (1 vs 3) is a new
+    clause and stays as spoken."""
+    rwords = list(_WORD_RX.finditer(rest))
+    if len(rwords) < 2 or rwords[0].group(0).lower() != anchor:
+        return False
+    return _anchor_pos(region, rest, anchor) is not None
+
+
+def _starts_replacement(out: str, rest: str) -> bool:
+    """Evidence that a cue word is a correction and not ordinary speech.
+
+    Only a clean parallel swap counts: the replacement repeats the clause
+    opening ("call Sarah, no, call Mark"), reuses the same preposition or
+    determiner ("to John, no, to Mary"), swaps a value of the same shape
+    (number/day/address/path), or shares a tail where the changed slot is
+    the word right before it ("eggs and milk, no, oat milk"). A shared tail
+    that begins after a preposition is a phrase rewrite, not a slot swap:
+    "Put the box on the table, no, under the table" stays as spoken.
+    """
+    rest = _replacement(rest)
+    first = _first_word(rest)
+    if not first or first in _FUNCTION - _ANCHORS:
+        return False
+    start, _ = _region_bounds(out)
+    region = out[start:]
+    if not region.strip():
+        return False
+    if first == _clause_lead(region)[1] and not _is_function_word(first):
+        return True
+    if first in _ANCHORS and _anchor_swap(region, rest, first):
+        return True
+    trailing, leading = _trailing_chunk(region), _leading_chunk(rest)
+    if _same_shape(trailing, leading):
+        if _is_number_token(leading) or _day_month(leading):
+            return _value_phrase(rest)
+        # an address or a path stands alone: "a@b.com, no, c@d.com"
+        head = rest
+        nxt = _CUE.search(head)
+        if nxt:
+            head = head[:nxt.start()]
+        return head.strip().rstrip(" \t,;:.!?…—–-") == leading
+    category = _value_category(first)
+    if category and _last_value(region, category) is not None \
+            and _value_phrase(rest):
+        return True
+    shared = _shared_suffix_len(region, rest)
+    if shared:
+        words = list(_WORD_RX.finditer(region))
+        p_idx = len(words) - shared
+        if p_idx > 0 and words[p_idx - 1].group(0).lower() not in _ANCHORS:
+            return True
+    return False
+
+
+def _drops_words(region: str, repl: str) -> bool:
+    """Would the replacement's cut delete a word the speaker said and the
+    replacement does not carry?
+
+    "Order two pizzas, no, three" cuts at the number and drops "pizzas": the
+    speaker meant "Order three pizzas". Losing a word is worse than leaving
+    the correction for the cleanup model, so a value swap is only taken when
+    the words after the value are carried by the replacement ("Tuesday
+    morning" -> "Wednesday morning") or are part of the value itself ("June
+    5th" -> "June 6th at 4").
+    """
+    first = _first_word(repl)
+    lead = _clause_lead(region)[1]
+    if first and first == lead and not _is_function_word(first):
+        return False                      # the replacement restates the clause
+    if first in _ANCHORS:
+        return False                      # parallel slot of equal length
+    category = _value_category(first)
+    if not category:
+        return False
+    value = _last_value(region, category)
+    if not value:
+        return False
+    after = set(_content_words(repl))
+    for m in _WORD_RX.finditer(region[value.end():]):
+        w = m.group(0).lower()
+        if (w in after or w in _VALUE_UNITS or w in _TIME_OF_DAY
+                or w in _PREP or _is_number_token(w) or _day_month(w)):
+            continue
+        return True
+    return False
+
+
+def _is_correction(out: str, cue: str, kind: str, rest: str,
+                   pre_pause: bool, post_pause: bool) -> bool:
+    if kind == "hard":
+        # A dictation that is only a retraction keeps its words: "Never
+        # mind." must not become empty output.
+        if not out.strip() and not _rest_has_content(rest):
+            return False
+        return True
+    if not out.strip():
+        return False
+    if not _rest_has_content(rest):
+        return False
+    evidence = _starts_replacement(out, rest)
+    if _blocked(cue, rest) and not evidence:
+        return False
+    start, _ = _region_bounds(out)
+    if _drops_words(out[start:], _replacement(rest)):
+        return False
+    body = out.rstrip()
+    at_start = not body or body[-1] in ".!?…\n"
+    if _STRONG.search(cue):
+        # "make that 4" / "or rather Tuesday" need a value or a pause;
+        # "I need you to make that call" and "change that tire" are verbs.
+        if pre_pause or post_pause or at_start:
+            return True
+        return evidence or _value_category(_first_word(rest)) is not None
+    # Everything else - bare "no", "wait", "actually", "sorry", "I mean",
+    # "never mind" - needs a parallel swap. A pause alone is not enough:
+    # "Red paint, no, blue" and "five dollars, no more, no less" are prose.
+    return evidence
+
+
+def _retract(out: str, cue: str, kind: str, rest: str) -> str:
+    start, _ = _region_bounds(out)
+    if kind == "hard":
+        # "never mind that last part" retracts the last clause, not the whole
+        # thought; "scratch that" keeps its original clause/sentence rule.
+        if re.search(r"\blast\s+part\b", cue, _I) \
+                and (not out.rstrip() or out.rstrip()[-1] not in ".!?…\n"):
+            body = out[start:].rstrip(" \t,;:—–-")
+            commas = list(re.finditer(r"[,;—–-]", body))
+            keep = start + (commas[-1].end() if commas else 0)
+            return out[:keep].rstrip(" \t,;:—–-")
+        return out[:start].rstrip()
+    region = out[start:]
+    cut = start + _replace_cut(region, rest)
+    return out[:cut].rstrip(" \t,;:—–-")
+
+
+def _drop_repeat(prefix: str, rest: str) -> str:
+    """'meet at' + 'at six' -> 'meet at six': don't say the anchor twice."""
+    m = re.match(r"\s*([A-Za-z0-9]+(?:[-'’][A-Za-z0-9]+)*)\b\s*", rest)
+    if not m:
+        return rest
+    words = _WORD_RX.findall(prefix.lower())
+    if words and m.group(1).lower() == words[-1] and words[-1] in _ANCHORS | _CONJ:
+        return rest[m.end():]
+    return rest
+
+
+def _cap_first(text: str) -> str:
+    for i, ch in enumerate(text):
+        if ch.isalpha():
+            return text[:i] + ch.upper() + text[i + 1:]
+    return text
+
+
+def _self_correct(text: str) -> str:
+    out, pos, cap_next = "", 0, False
     while True:
-        m = _SCRATCH.search(text)
+        m = _CUE.search(text, pos)
         if not m:
-            return text
-        before = text[:m.start()].rstrip()
-        # find the boundary of the clause being retracted
-        ends = [x.end() for x in _SENTENCE_END.finditer(before)]
-        if ends and ends[-1] == len(before):
-            # trigger opened a sentence: retract the whole previous sentence
-            ends = ends[:-1]
-        cut = ends[-1] if ends else 0
-        rest = text[m.end():]
-        rest = rest[:1].upper() + rest[1:]
-        text = (text[:cut].rstrip() + " " + rest).strip()
+            tail = text[pos:]
+            if cap_next:
+                tail = _cap_first(tail)
+            return (out + tail).strip()
+        chunk = text[pos:m.start()]
+        if cap_next and any(c.isalpha() for c in chunk):
+            chunk = _cap_first(chunk)
+            cap_next = False
+        out += chunk
+        cue, rest = m.group("cue"), text[m.end():]
+        chain = m.group("chain") or ""
+        post_pause = bool(m.group("pause"))
+        pre_pause = bool(out.rstrip()) and out.rstrip()[-1] in ",;:—–-"
+        kind = _cue_kind(cue, chain, rest, post_pause)
+        if _is_correction(out, cue, kind, rest, pre_pause, post_pause):
+            prefix = _retract(out, cue, kind, rest)
+            body = prefix.rstrip()
+            cap_next = not body or body[-1] in ".!?…\n"
+            sep = " "
+            if kind == "hard" and body \
+                    and body[-1] not in ".!?…\n" and _rest_has_content(rest):
+                sep = ", "
+            out = prefix + (sep if prefix else "")
+            trimmed = _drop_repeat(out, rest)
+            if re.search(r"\b(?:make|change)\s+(?:that|it)\b", cue, _I):
+                lead = re.match(r"\s*to\s+", trimmed, _I)
+                if lead:
+                    trimmed = trimmed[lead.end():]
+            pos = m.end() + (len(rest) - len(trimmed))
+        else:
+            out += m.group(0)
+            pos = m.end()
 
 
 # ------------------------------------------------------------ list markers
@@ -241,7 +948,7 @@ def prepass(text: str, aliases: list[tuple[re.Pattern, str]] = (), capitalize: b
         text = rx.sub(rep, text)
     text = _list_markers(text)
     text = _inline_numbering(text)
-    text = _retract(text)
+    text = _self_correct(text)
     for rx, rep in _TIDY:
         text = rx.sub(rep, text)
     text = _tidy_lists(text)
@@ -260,7 +967,7 @@ _PROMPT = """You are a dictation formatter. Turn raw speech-to-text into clean w
 
 RULES
 1. Preserve every content word the speaker said. Never drop, summarize, expand, or answer. If unsure, keep it.
-2. Remove fillers (um, uh, you know, like, "so" at sentence start), stutters and false starts. Apply self-corrections: "five, no, six" -> "six". After "scratch that" / "actually" / "I mean", KEEP the words that follow and delete the phrase before it.
+2. Remove fillers (um, uh, you know, like, "so" at sentence start), stutters and false starts. Apply every self-correction, including several in one dictation: "Tuesday, oh wait no, Wednesday" -> "Wednesday"; "eggs and milk, no, oat milk" -> "eggs and oat milk"; "never mind that last part" -> drop the thought before it. After "scratch that" / "strike that" / "actually" / "I mean" / "make that", KEEP the words that follow and delete the phrase before them. The words "no", "wait", "actually", "sorry", "never mind" and "I mean" are ordinary speech too: "No, I don't think so", "wait for me at the door", "I mean it", "Actually, the movie was better than I expected", "It's fine, actually, I like it" and "Thanks, never mind, I found it" stay as they are. Only drop one of these words when it introduces a correction of words said right before it.
 3. Use normal sentence case. Undo Title Case the recognizer invented. Fix punctuation. Keep line breaks that are already in the text. Keep the mark each sentence ends on: a question keeps its "?", an exclamation keeps its "!". Never end a question with a period.
 4. Spoken symbol names that are still words become symbols: "dot"->".", "at"->"@" only inside an email address, "hashtag word"->#word (joined), "dash"->"-", "hyphen"->"-", "colon"->":", "comma"->",", "equals"->"=", "plus"->"+", "star"->"*", "hash"->"#".
 5. Spoken code, paths, commands and addresses become literal: "get user (user id)"->get_user(user_id); "jonny at example dot com"->jonny@example.com; "npm --version" stays; "/home/jon" stays.
@@ -282,6 +989,18 @@ in: hashtag local peer is live at eight tonight!
 out: #localpeer is live at 8 tonight!
 in: pick up the dry cleaning, scratch that, the cleaners are closed on Mondays
 out: The cleaners are closed on Mondays.
+in: let's meet Tuesday, oh wait no, Wednesday at 3
+out: Let's meet Wednesday at 3.
+in: grab eggs and milk, no, oat milk
+out: Grab eggs and oat milk.
+in: call Sarah. No, call Mark. Meet at five, no, six
+out: Call Mark. Meet at six.
+in: no, I don't think so
+out: No, I don't think so.
+in: wait for me at the door
+out: Wait for me at the door.
+in: I mean it
+out: I mean it.
 in: my top goals this week are one finish the report two send the presentation three book the flights
 out: My top goals this week are:
 1. Finish the report
@@ -357,6 +1076,55 @@ def _content_words(text: str) -> list[str]:
     return [w for w in _WORD.findall(text.lower()) if w not in _SKIP and len(w) > 1]
 
 
+def _content_index(text: str) -> list[tuple[int, str]]:
+    """Content words with their position, so the guard can talk about *which*
+    occurrence of a word was dropped (and whether a cue licensed it)."""
+    return [(m.start(), m.group(0)) for m in _WORD.finditer(text.lower())
+            if m.group(0) not in _SKIP and len(m.group(0)) > 1]
+
+
+def _forgiven_ranges(source: str) -> list[tuple[int, int]]:
+    """Character ranges of the dictation a leftover correction cue licenses the
+    cleanup model to drop.
+
+    The prompt tells the model to delete the cue and the words the speaker took
+    back, so a correct repair must not read as content loss: "Book the flight
+    for Monday. Never mind, just book it for Tuesday." -> "Book the flight for
+    Tuesday." drops Monday, and "Book the flight for Monday, let me rephrase
+    that, book it for Tuesday." -> "Book it for Tuesday." drops the whole
+    first clause. Both are the correction working.
+
+    The span is the cue itself plus the thought it replaces, found with the
+    same rule the pre-pass uses (region = the clause the cue interrupts; hard
+    cues retract all of it, replace cues only the part the replacement
+    supersedes). A word the replacement also says is not replaced by it, so it
+    is still required. Words outside those spans were never corrected, so
+    dropping them is still a failure.
+    """
+    out: list[tuple[int, int]] = []
+    for m in _CUE.finditer(source):
+        cue, rest = m.group("cue"), source[m.end():]
+        chain = m.group("chain") or ""
+        post_pause = bool(m.group("pause"))
+        out.append((m.start(), m.end()))          # the cue words themselves
+        if not _rest_has_content(rest):
+            continue
+        start, _ = _region_bounds(source[:m.start()])
+        region = source[start:m.start()]
+        if not region.strip():
+            continue
+        kind = _cue_kind(cue, chain, rest, post_pause)
+        cut = 0 if kind == "hard" else _replace_cut(region, rest)
+        after = set(_content_words(_replacement(rest)))
+        base = start + cut
+        for wm in _WORD.finditer(region[cut:].lower()):
+            w = wm.group(0)
+            if w in _SKIP or len(w) <= 1 or w in after:
+                continue
+            out.append((base + wm.start(), base + wm.end()))
+    return out
+
+
 def _respelled(word: str, have: set[str]) -> bool:
     """True if some output token is a close spelling of `word`: the model is
     allowed to fix a misheard name (Johnny -> Jonny), a plural, a tense."""
@@ -365,6 +1133,66 @@ def _respelled(word: str, have: set[str]) -> bool:
                 and difflib.SequenceMatcher(None, word, cand).ratio() >= 0.75:
             return True
     return False
+
+
+def _post_cue_lead(source: str, cleaned: str) -> bool:
+    """The model's first kept word comes from after a leftover correction
+    cue: the word before the cue may be the one the speaker retracted.
+    "Red paint, no, blue" -> "Blue paint" is a repair, not a clipped opening;
+    "Blue" alone loses the shared noun and is rejected. "No, call Mark" ->
+    "Mark" still has nothing before the cue to retract."""
+    m = _CUE.search(source)
+    if not m or not source[:m.start()].strip():
+        return False
+    body = _content_words(cleaned)
+    if not body:
+        return False
+    after = set(_content_words(source[m.end():]))
+    if body[0] not in after:
+        return False
+    before = set(_content_words(source[:m.start()]))
+    kept = sum(1 for w in body if w in before)
+    return kept >= len(before) // 2
+
+
+# Cue words that are also ordinary speech. The model may drop one only as part
+# of a correction it actually made, i.e. some of the words the cue reaches back
+# over are gone too. When everything before it survives, nothing was corrected
+# and the word was meaning: "Actually, the movie was better", "It's fine,
+# actually, I like it", "Thanks, never mind, I found it". These words are in
+# _FILLERS, so the content-word count alone never notices them going missing.
+_DISCOURSE = re.compile(r"\b(actually|i\s+mean|never\s*mind|sorry)\b", _I)
+
+
+def _discourse_key(phrase: str) -> str:
+    return re.sub(r"\s+", "", phrase.lower())
+
+
+def _dropped_discourse(source: str, cleaned: str, kept) -> str:
+    """The first discourse word the model dropped without correcting anything,
+    or "". The span a cue reaches back over is the one the pre-pass uses; a
+    filler-only clause ("Friday morning, um, sorry, Saturday") is skipped so
+    the cue is judged against the words it actually corrects."""
+    need: dict[str, int] = {}
+    for m in _DISCOURSE.finditer(source):
+        end = m.start()
+        while True:
+            start, _ = _region_bounds(source[:end])
+            words = _content_words(source[start:m.start()])
+            if words or start == 0:
+                break
+            end = start
+        if all(kept(w) for w in words):
+            k = _discourse_key(m.group(1))
+            need[k] = need.get(k, 0) + 1
+    have: dict[str, int] = {}
+    for m in _DISCOURSE.finditer(cleaned):
+        k = _discourse_key(m.group(1))
+        have[k] = have.get(k, 0) + 1
+    for k, n in need.items():
+        if have.get(k, 0) < n:
+            return k
+    return ""
 
 
 def guard(source: str, cleaned: str) -> tuple[bool, str]:
@@ -376,23 +1204,39 @@ def guard(source: str, cleaned: str) -> tuple[bool, str]:
     clipped opening (the first content word is gone — "Hey Sy, remind me"
     coming back as "Remind me"; under the bulk limit, so it went unnoticed
     until the Call made it audible on 09-05).
+
+    Words a correction cue licenses the model to drop are not losses: the
+    prompt asks it to remove the cue and the words the speaker took back.
+    Without that, a correct repair reads as 4 dropped words and gets thrown
+    away. Everything outside those spans must survive.
     """
-    src = _content_words(source)
-    if not src:
+    spans = _content_index(source)
+    if not spans:
         return True, ""
+    src = [w for _, w in spans]
     have = set(_WORD.findall(cleaned.lower()))
     # a source word counts as kept if it survives whole or as a prefix/suffix
     # of a joined token (get_user -> "get","user"; localpeer <- "local","peer")
     joined = cleaned.lower()
-    missing = [w for w in src if w not in have and w not in joined
-               and not _respelled(w, have)]
+    forgiven = _forgiven_ranges(source)
+    lost: list[int] = []
+    for i, (pos, w) in enumerate(spans):
+        if w in have or w in joined or _respelled(w, have):
+            continue
+        if any(a <= pos < b for a, b in forgiven):
+            continue
+        lost.append(i)
     limit = max(3, int(len(src) * 0.15))
-    if len(missing) > limit:
-        return False, f"{len(missing)}/{len(src)} content words dropped"
-    if src[-1] in missing:
+    if len(lost) > limit:
+        return False, f"{len(lost)}/{len(src)} content words dropped"
+    if lost and lost[-1] == len(spans) - 1:
         return False, f"trailing word dropped: {src[-1]!r}"
-    if src[0] in missing:
+    if lost and lost[0] == 0 and not _post_cue_lead(source, cleaned):
         return False, f"leading word dropped: {src[0]!r}"
+    gone = _dropped_discourse(
+        source, cleaned, lambda w: w in have or w in joined or _respelled(w, have))
+    if gone:
+        return False, f"discourse word dropped: {gone!r}"
     return True, ""
 
 

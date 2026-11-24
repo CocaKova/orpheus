@@ -1,9 +1,9 @@
 """Orpheus — local dictation engine.
 
 OpenAI-compatible speech-to-text server wrapping NVIDIA Parakeet TDT,
-with a deterministic spoken-symbol pre-pass ("open paren", "new line",
-"exclamation point", "bullet point", "number one" -> symbols and list
-lines) and an optional LLM cleanup pass (fillers, punctuation, casing,
+with a deterministic spoken-symbol pre-pass and self-correction ("open paren",
+"new line", "exclamation point", "bullet point", "number one" -> symbols and
+list lines) and an optional LLM cleanup pass (fillers, punctuation, casing,
 code/paths/numbers, personal dictionary, spoken enumerations laid out as
 lists) via any OpenAI-compatible chat endpoint running on the same box. A
 plain "I need eggs, milk, bread and cheese" becomes a bulleted list with or
